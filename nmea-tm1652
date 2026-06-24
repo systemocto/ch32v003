@@ -1,0 +1,646 @@
+#include "ch32v00x.h"
+
+// ============================================================================
+// CONFIGURATIE & CONFIGURATIE-PARAMETERS
+// ============================================================================
+
+#define TM1652_PIN  1  // PC1 (Sluit hier de SDA/RX lijn van de TM1652 op aan)
+#define GPS_RX_PIN  6  // PD6 (Vaste hardware USART1 RX pin voor de GPS module)
+#define BRIGHTNESS  1  // BRIGHTNESS 0 - 7
+uint8_t  brightness = BRIGHTNESS;
+
+// Hulpvariabelen voor de hoofdloop timing
+uint32_t start_systick_seconde;
+uint32_t laatste_gps_pakket_tijd;
+uint8_t  freerunning_modus = 1;
+uint8_t  freerunning_modus_old = 1;
+uint8_t  dubbelepunt_aan = 1;
+
+const uint32_t EEN_SECONDE_CYCLI = 24000000; 
+const uint32_t TIMEOUT_CYCLI     = 36000000;     
+
+// 1 = UTC+1 (Nederlandse Wintertijd)
+// 2 = UTC+2 (Nederlandse Zomertijd)
+#define TIMEZONE_OFFSET   2  
+
+// Startwaarde: 24.000.000 * 1000 = 24.000.000.000 (Past perfect in uint32_t of uint64_t)
+volatile uint64_t gemiddelde_seconde_fixed = 24000000000ULL; 
+volatile uint32_t laatste_gps_systick = 0;
+volatile uint8_t  eerste_sync_gehad = 0;
+
+volatile uint32_t pps_led_start_tijd = 0;
+volatile uint8_t  pps_led_actief = 0;
+
+
+// Directe macro's om de TM1652 datalijn te besturen via het BSHR register
+#define SDA_HIGH()  (GPIOC->BSHR = (1 << TM1652_PIN))
+#define SDA_LOW()   (GPIOC->BSHR = (1 << (TM1652_PIN + 16)))
+
+// Segment-definities voor de cijfers 0 t/m 9 van de TM1652
+const uint8_t CijferTabel[] = {
+    0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f
+};
+
+const uint8_t BrightTabel[] = {
+    0x00, 0x04, 0x02, 0x06, 0x01, 0x05, 0x03, 0x07
+};
+
+// Globale variabelen voor de NMEA parser (gebruikt in de interrupt)
+volatile uint8_t nmea_state = 0;
+volatile uint8_t komma_teller = 0;
+volatile char tijd_buffer[6];
+volatile uint8_t tijd_index = 0;
+volatile uint8_t nieuwe_tijd_beschikbaar = 0;
+
+// Globale variabelen voor de interne vrije klok-engine
+volatile uint8_t interne_uren = 12;   // Standaard opstarttijd 12:00
+volatile uint8_t interne_minuten = 0;
+volatile uint8_t interne_seconden = 0;
+
+// ============================================================================
+// INITIALISATIE & SYSTEEM TIMING
+// ============================================================================
+
+/* 
+ * Start op het Externe 24 MHz Kristal (HSE) voor maximale frequentiestabiliteit
+ */
+void SystemInitBareMetal_HSE_24MHz(void) {
+    RCC->APB2PCENR |= RCC_AFIOEN; // AFIO inschakelen
+    RCC->CTLR |= RCC_HSEON;       // Start het externe kristal (24 MHz)
+    while((RCC->CTLR & RCC_HSERDY) == 0); // Wacht tot het stabiel trilt
+
+    FLASH->ACTLR = 0;             // Flash op 0 wait states (optimaal voor 24 MHz)
+    RCC->CFGR0 = RCC_SW_HSE;      // Schakel om naar het 24 MHz kristal
+    while((RCC->CFGR0 & RCC_SWS) != RCC_SWS_HSE); // Wacht op hardwarebevestiging
+}
+
+void SystemInitBareMetal_HSI_24MHz(void) {
+    // 1. Schakel HSI in (High-Speed Internal RC)
+    RCC->CTLR |= RCC_HSION;
+    
+    // 2. Wacht tot de HSI stabiel is
+    while((RCC->CTLR & RCC_HSIRDY) == 0);
+
+    // 3. Zet Flash op 0 wait states (optimaal voor 24 MHz)
+    FLASH->ACTLR = 0;
+
+    // 4. Forceer de klokdeler naar DIV1 (wist de DIV8 van de fabriek)
+    // SW = 00 (Kies HSI als systeemklok)
+    RCC->CFGR0 = 0x00000000; 
+}
+
+/* 
+ * Microseconden delay via de SysTick hardware counter
+ */
+void Delay_us(uint32_t us) {
+    uint32_t start = SysTick->CNT;
+    uint32_t cycli = us * 24; // 24 hardware-stappen per microseconde bij 24 MHz
+    while((SysTick->CNT - start) < cycli);
+}
+
+void Peripherals_Init(void) {
+    RCC->APB2PCENR |= RCC_AFIOEN | RCC_IOPCEN | RCC_IOPDEN | RCC_USART1EN; 
+
+    // PC1 als Push-Pull Output (0x3) voor TM1652
+    GPIOC->CFGLR &= ~(0xF << 4);  GPIOC->CFGLR |= (0x3 << 4); SDA_HIGH(); 
+
+    // PD6 als Input Floating (0x4) voor Hardware USART1 RX (GPS)
+    GPIOD->CFGLR &= ~(0xF << 24); GPIOD->CFGLR |= (0x4 << 24);   
+
+    // UPDATE: PD5 als NORMALE Output Push-Pull (0x3) voor 115200 Bit-Bang TX naar PC
+    GPIOD->CFGLR &= ~(0xF << 20); GPIOD->CFGLR |= (0x3 << 20);   
+    GPIOD->BSHR = (1 << 5); // Ruststand van UART TX is HOOG
+
+    // UPDATE: PD4 als NORMALE Output Push-Pull (0x3) voor de PPS-LED (Geïnverteerd)
+    GPIOD->CFGLR &= ~(0xF << 16); GPIOD->CFGLR |= (0x3 << 16);   
+    GPIOD->BSHR = (1 << 4); // Geïnverteerd opstarten (LED staat UIT)
+
+    // Activeer vanaf nu alleen de ONTVANGER (RE) en de interrupt. De zender (TE) slopen we eruit!
+    USART1->CTLR1 &= ~USART_CTLR1_TE; // Zorg dat hardware-TX uit staat
+    USART1->CTLR1 |= USART_CTLR1_UE | USART_CTLR1_RE | USART_CTLR1_RXNEIE;
+
+    NVIC_EnableIRQ(USART1_IRQn);
+    SysTick->CTLR = 0x00000005; 
+}
+
+const uint32_t BaudrateTabel[] = {115200, 57600, 38400, 19200, 9600, 4800};
+#define AANTAL_BAUDRATES (sizeof(BaudrateTabel) / sizeof(BaudrateTabel))
+
+volatile uint8_t huidige_baudrate_index = 0;
+volatile uint8_t baudrate_gevonden = 0;
+
+// Minimale initialisatie van de UART-ontvanger om te kunnen scannen
+void UART1_ScanInit(uint32_t baudrate) {
+    USART1->CTLR1 &= ~USART_CTLR1_UE;
+    USART1->BRR = (uint16_t)(24000000 / baudrate);
+    // Zet alleen de USART en de ontvanger (RE) aan, nog GEEN interrupts
+    USART1->CTLR1 |= USART_CTLR1_UE | USART_CTLR1_RE; 
+}
+
+void UART1_DetecteerBaudrate(void) {
+    uint32_t start_tijd;
+    
+    // Zorg dat de RX pin (PD6) als input floating staat
+    RCC->APB2PCENR |= RCC_IOPDEN | RCC_USART1EN;
+    GPIOD->CFGLR &= ~(0xF << 24);
+    GPIOD->CFGLR |=  (0x4 << 24);
+
+    while (!baudrate_gevonden) {
+        uint32_t test_baudrate = BaudrateTabel[huidige_baudrate_index];
+        UART1_ScanInit(test_baudrate);
+        
+        // Wacht maximaal 1,5 seconde op deze baudrate om een '$' te spotten
+        start_tijd = SysTick->CNT;
+        const uint32_t ANDERHALVE_SECONDE = 36000000;
+        
+        while ((SysTick->CNT - start_tijd) < ANDERHALVE_SECONDE) {
+            // Controleer of er een byte klaarstaat in het hardware register
+            if (USART1->STATR & USART_STATR_RXNE) {
+                char c = (char)(USART1->DATAR);
+                if (c == '$') {
+                    baudrate_gevonden = 1;
+                    break; // Gevonden! Verlaat de tijdsloop
+                }
+            }
+        }
+        
+        // Als er na 1,5 seconde geen '$' is gezien, probeer de volgende index
+        if (!baudrate_gevonden) {
+            huidige_baudrate_index++;
+            if (huidige_baudrate_index >= AANTAL_BAUDRATES) {
+                huidige_baudrate_index = 0; // Begin weer vooraan
+            }
+        }
+    }
+}
+
+// ============================================================================
+// TM1652 DISPLAY PROTOCOL (19200 BAUD, 8O1)
+// ============================================================================
+
+/* 
+ * Bit-bang functie om 1 byte te verzenden via 19200 Baud met Oneven (ODD) Pariteit
+ */
+void TM1652_SendByte(uint8_t byte) {
+    uint8_t parity_bit = 1; // Start op 1 voor ODD pariteit
+
+    SDA_LOW(); // 1. START BIT (Altijd LAAG)
+    Delay_us(52); // Bitduur bij 19200 baud is ~52 microseconden
+
+    // 2. DATA BITS (8 stuks, LSB eerst)
+    for (uint8_t i = 0; i < 8; i++) {
+        if (byte & 0x01) {
+            SDA_HIGH(); parity_bit ^= 1;
+        } else {
+            SDA_LOW();
+        }
+        Delay_us(52); byte >>= 1;
+    }
+
+    // 3. PARITEIT BIT (ODD)
+    if (parity_bit) SDA_HIGH(); else SDA_LOW(); 
+    Delay_us(52);
+
+    SDA_HIGH(); // 4. STOP BIT (Altijd HOOG)
+    Delay_us(52);
+    Delay_us(50); // Inter-packet pauze
+}
+
+/* 
+ * Stuurt de uren en minuten naar de TM1652 display registers
+ */
+void TM1652_DisplayTijd(uint8_t u, uint8_t m, uint8_t dp) {
+    uint8_t u1 = u / 10;
+    uint8_t u2 = u % 10;
+    uint8_t m1 = m / 10;
+    uint8_t m2 = m % 10;
+
+    TM1652_SendByte(0x08); // Startadres voor display-cijfer data
+    TM1652_SendByte(CijferTabel[u1]);
+    
+    // Voeg bit 7 (0x80) toe aan het tweede cijfer als de dubbele punt aan moet
+    if (dp) {
+        TM1652_SendByte(CijferTabel[u2] | 0x80); 
+    } else {
+        TM1652_SendByte(CijferTabel[u2]);        
+    }
+    TM1652_SendByte(CijferTabel[m1]);
+    TM1652_SendByte(CijferTabel[m2]);
+
+    Delay_us(500);
+    TM1652_SendByte(0x18); // Adres voor Helderheid/Mode regeling
+    TM1652_SendByte(0x18 + (BrightTabel[brightness] & 0x07) << 1); // Display AAN, Mode 8x5, Helderheid level <brightness>
+}
+
+
+// ============================================================================
+// NMEA PARSER & HARDWARE INTERRUPT HANDLER
+// ============================================================================
+
+/* 
+ * Hardware Interrupt Handler - Verwerkt NMEA op 115200 baud parallel op de achtergrond
+ */
+void USART1_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void USART1_IRQHandler(void) {
+    if(USART1->STATR & USART_STATR_RXNE) {
+        char c = (char)(USART1->DATAR);
+
+        // --- TRANSPARANTE GATEWAY ---
+        // Stuur elke binnengekomen byte van de GPS direct 1-op-1 door naar de PC!
+        //while((USART1->STATR & USART_STATR_TXE) == 0); // Wacht tot TX-buffer vrij is
+        //USART1->DATAR = c;
+        // ----------------------------
+
+        // NMEA Parser State Machine (blijft ongewijzigd op de achtergrond meeluisteren)
+        if (c == '$') { nmea_state = 1; return; }
+        if (nmea_state == 1 && c == 'G') { nmea_state = 2; return; }
+        if (nmea_state == 2 && (c == 'P' || c == 'N')) { nmea_state = 3; return; }
+        if (nmea_state == 3 && c == 'R') { nmea_state = 4; return; }
+        if (nmea_state == 4 && c == 'M') { nmea_state = 5; return; return; }
+        if (nmea_state == 5 && c == 'C') { 
+            nmea_state = 6; komma_teller = 0; tijd_index = 0; return; 
+        }
+
+        if (nmea_state == 6) {
+            if (c == ',') { komma_teller++; return; }
+            if (komma_teller == 1) {
+                if (tijd_index < 6) { tijd_buffer[tijd_index++] = c; }
+            } 
+            else if (komma_teller == 2) {
+                nieuwe_tijd_beschikbaar = 1;
+                nmea_state = 0; 
+            }
+        }
+    }
+}
+
+/* 
+ * Genereert en zendt een proprietary NMEA-bericht met live kristal-kalibratiedata
+ * Formaat: $PWCHCLK,hele_hz,fractie_mhz,baudrate_index*CS\r\n
+ */
+void UART1_ZendProprietaryData(void) {
+    char body[64];
+    uint8_t checksum = 0;
+    int idx = 0;
+
+    // Haal de gekalibreerde fixed-point waarden op
+    uint32_t hele_hz = (uint32_t)(gemiddelde_seconde_fixed / 1000ULL);
+    uint32_t fractie  = (uint32_t)(gemiddelde_seconde_fixed % 1000ULL);
+
+    // 1. Bouw de NMEA proprietary header: POH1CL1
+    body[idx++] = 'P'; body[idx++] = 'O'; body[idx++] = 'H';
+    body[idx++] = 'C'; body[idx++] = 'L'; body[idx++] = 'K'; body[idx++] = '1';
+    body[idx++] = ',';
+
+    // 2. Voeg Hele Hz toe (bijv. 24000120)
+    uint32_t temp = hele_hz;
+    int start_idx = idx;
+    if (temp == 0) {
+        body[idx++] = '0';
+    } else {
+        while (temp > 0) {
+            body[idx++] = (temp % 10) + '0';
+            temp /= 10;
+        }
+        // Omdraaien omdat we van achter naar voren hebben opgebouwd
+        for (int i = 0; i < (idx - start_idx) / 2; i++) {
+            char t = body[start_idx + i];
+            body[start_idx + i] = body[idx - 1 - i];
+            body[idx - 1 - i] = t;
+        }
+    }
+    body[idx++] = ',';
+
+    // 3. Voeg Fractie mHz toe met voorloop-nullen (bijv. 045)
+    body[idx++] = (fractie / 100) + '0';
+    body[idx++] = ((fractie % 100) / 10) + '0';
+    body[idx++] = (fractie % 10) + '0';
+    body[idx++] = ',';
+
+    // 4. Voeg de actieve Lock-Baudrate Index toe (0 t/m 5)
+    body[idx++] = huidige_baudrate_index + '0';
+    body[idx++] = ',';
+
+    // 4. Voeg de actieve clocksource Index toe (0 t/m 1)
+    body[idx++] = freerunning_modus + '0';
+
+    // --- CHECKSUM BEREKENING ---
+    for (int i = 0; i < idx; i++) {
+        checksum ^= body[i];
+    }
+
+    // --- VERZENDING OVER UART (PD5) ---
+    UART1_SendChar('$'); 
+    
+    for (int i = 0; i < idx; i++) {
+        UART1_SendChar(body[i]);
+    }
+    
+    UART1_SendChar('*'); 
+    
+    // Checksum omzetten naar 2 hex-karakters
+    uint8_t high_nibble = (checksum >> 4) & 0x0F;
+    uint8_t low_nibble  = checksum & 0x0F;
+    UART1_SendChar(high_nibble < 10 ? high_nibble + '0' : high_nibble - 10 + 'A');
+    UART1_SendChar(low_nibble < 10 ? low_nibble + '0' : low_nibble - 10 + 'A');
+    
+    UART1_SendChar('\r');
+    UART1_SendChar('\n');
+}
+
+void Klok_VerwerkGPS(void) {
+    nieuwe_tijd_beschikbaar = 0;
+    freerunning_modus = 0; 
+    laatste_gps_pakket_tijd = SysTick->CNT; 
+
+    uint8_t gps_u = ((tijd_buffer[0] - '0') * 10) + (tijd_buffer[1] - '0');
+    uint8_t gps_m = ((tijd_buffer[2] - '0') * 10) + (tijd_buffer[3] - '0');
+    uint8_t gps_s = ((tijd_buffer[4] - '0') * 10) + (tijd_buffer[5] - '0');
+
+    if (gps_u < 24 && gps_m < 60 && gps_s < 60) {
+        uint32_t nu_systick = SysTick->CNT;
+        if (eerste_sync_gehad) {
+            uint32_t werkelijke_cycli = nu_systick - laatste_gps_systick;
+            if (werkelijke_cycli > 23900000 && werkelijke_cycli < 24100000) {
+                uint64_t huidige_meting_fixed = (uint64_t)werkelijke_cycli * 1000ULL;
+                if (huidige_meting_fixed > gemiddelde_seconde_fixed) {
+                    gemiddelde_seconde_fixed += (huidige_meting_fixed - gemiddelde_seconde_fixed) >> 10;
+                } else {
+                    gemiddelde_seconde_fixed -= (gemiddelde_seconde_fixed - huidige_meting_fixed) >> 10;
+                }
+            }
+        } else {
+            eerste_sync_gehad = 1;
+        }
+        laatste_gps_systick = nu_systick;
+
+        int8_t lokale_uren = gps_u + TIMEZONE_OFFSET;
+        if (lokale_uren >= 24)      lokale_uren -= 24;
+        else if (lokale_uren < 0)  lokale_uren += 24;
+
+        interne_uren = (uint8_t)lokale_uren;
+        interne_minuten = gps_m;
+        interne_seconden = gps_s;
+        
+        start_systick_seconde = nu_systick; 
+        dubbelepunt_aan = (interne_seconden % 2 == 0);
+        
+        TM1652_DisplayTijd(interne_uren, interne_minuten, dubbelepunt_aan);
+
+        // Start de PPS-flits synchroon met de GPS
+        //GPIOD->BSHR = (1 << 4); // PD4 HOOG (LED AAN)
+        GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (Geïnverteerde LED gaat nu AAN)
+        pps_led_start_tijd = SysTick->CNT;
+        pps_led_actief = 1;
+
+        // Injecteer het proprietary kalibratiebericht
+        UART1_ZendProprietaryData();
+        //UART1_ZendGNRMC();
+    }
+}
+
+// Bare-metal hulpfunctie om een 2-cijferig getal met voorloopnul te zenden (bijv. "05" ipv "5")
+void UART1_Send2Digits(uint8_t getal) {
+    UART1_SendChar((getal / 10) + '0');
+    UART1_SendChar((getal % 10) + '0');
+}
+
+/* 
+ * Genereert en zendt een geldige $GNRMC zin op basis van de interne kloktijd
+ * Formaat: $GNRMC,hhmmss.00,A,5213.1234,N,00510.1234,E,0.0,0.0,220626,,,A*CS\r\n
+ */
+/*
+void UART1_ZendGNRMC(void) {
+    char nmea_body[80];
+    uint8_t checksum = 0;
+    int idx = 0;
+
+    // We bouwen de string handmatig op in een tijdelijke buffer (zonder zware sprintf)
+    // De string begint direct NA de '$' voor de checksum berekening
+    nmea_body[idx++] = 'G'; nmea_body[idx++] = 'N';
+    nmea_body[idx++] = 'R'; nmea_body[idx++] = 'M'; nmea_body[idx++] = 'C';
+    nmea_body[idx++] = ',';
+    
+    // Tijd: hhmmss.00
+    nmea_body[idx++] = (interne_uren / 10) + '0';   nmea_body[idx++] = (interne_uren % 10) + '0';
+    nmea_body[idx++] = (interne_minuten / 10) + '0'; nmea_body[idx++] = (interne_minuten % 10) + '0';
+    nmea_body[idx++] = (interne_seconden / 10) + '0'; nmea_body[idx++] = (interne_seconden % 10) + '0';
+    
+    nmea_body[idx++] = '.'; nmea_body[idx++] = '0'; nmea_body[idx++] = '0';
+    nmea_body[idx++] = ',';
+    
+    // Status: A = Valid (Geldige fix)
+    nmea_body[idx++] = 'A';
+    nmea_body[idx++] = ',';
+    
+    // Fictieve Positie (52°13.1234' N, 005°10.1234' E)
+    nmea_body[idx++] = '5'; nmea_body[idx++] = '2'; nmea_body[idx++] = '1'; nmea_body[idx++] = '3';
+    nmea_body[idx++] = '.'; nmea_body[idx++] = '1'; nmea_body[idx++] = '2'; nmea_body[idx++] = '3';
+    nmea_body[idx++] = '4'; nmea_body[idx++] = ','; nmea_body[idx++] = 'N'; nmea_body[idx++] = ',';
+    nmea_body[idx++] = '0'; nmea_body[idx++] = '0'; nmea_body[idx++] = '5'; nmea_body[idx++] = '1';
+    nmea_body[idx++] = '0'; nmea_body[idx++] = '.'; nmea_body[idx++] = '1'; nmea_body[idx++] = '2';
+    nmea_body[idx++] = '3'; nmea_body[idx++] = '4'; nmea_body[idx++] = ','; nmea_body[idx++] = 'E';
+    nmea_body[idx++] = ',';
+    
+    // Snelheid en koers (0.0, 0.0)
+    nmea_body[idx++] = '0'; nmea_body[idx++] = '.'; nmea_body[idx++] = '0'; nmea_body[idx++] = ',';
+    nmea_body[idx++] = '0'; nmea_body[idx++] = '.'; nmea_body[idx++] = '0'; nmea_body[idx++] = ',';
+    
+    // Datum: DDMMYY (Bijvoorbeeld 220626 voor 22 juni 2026)
+    nmea_body[idx++] = '2'; nmea_body[idx++] = '2'; // Dag
+    nmea_body[idx++] = '0'; nmea_body[idx++] = '6'; // Maand
+    nmea_body[idx++] = '2'; nmea_body[idx++] = '6'; // Jaar
+    nmea_body[idx++] = ',';
+    
+    // Magnetische variatie (leeg)
+    nmea_body[idx++] = ',';
+    
+    // Mode indicator: A = Autonomous
+    nmea_body[idx++] = 'A';
+
+    // --- CHECKSUM BEREKENING ---
+    // XOR alle karakters in de buffer met elkaar
+    for (int i = 0; i < idx; i++) {
+        checksum ^= nmea_body[i];
+    }
+
+    // --- VERZENDING OVER UART (PD5) ---
+    UART1_SendChar('$'); // Startteken (telt niet mee voor checksum) [|]
+    
+    // Zend de body van de RMC zin
+    for (int i = 0; i < idx; i++) {
+        UART1_SendChar(nmea_body[i]);
+    }
+    
+    UART1_SendChar('*'); // Checksum scheidingsteken [|]
+    
+    // Converteer de checksum byte naar 2 hexadecimale ASCII karakters (bijv. 0x4A -> "4A") [|]
+    uint8_t high_nibble = (checksum >> 4) & 0x0F;
+    uint8_t low_nibble  = checksum & 0x0F;
+    
+    UART1_SendChar(high_nibble < 10 ? high_nibble + '0' : high_nibble - 10 + 'A');
+    UART1_SendChar(low_nibble < 10 ? low_nibble + '0' : low_nibble - 10 + 'A');
+    
+    // NMEA afsluiter
+    UART1_SendChar('\r');
+    UART1_SendChar('\n');
+}
+*/
+
+void Klok_VerwerkInterneTijd(void) {
+    // Schuif de tijd-as op met de dynamisch geleerde fixed-point waarde
+    start_systick_seconde += (uint32_t)(gemiddelde_seconde_fixed / 1000ULL);
+
+    // Start de PPS-flits synchroon met de vrije klok
+    //GPIOD->BSHR = (1 << 4); // PD4 HOOG (LED AAN)
+    GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (Geïnverteerde LED gaat nu AAN)
+    pps_led_start_tijd = SysTick->CNT;
+    pps_led_actief = 1;
+
+    interne_seconden++;
+    if (interne_seconden >= 60) {
+        interne_seconden = 0;
+        interne_minuten++;
+        if (interne_minuten >= 60) {
+            interne_minuten = 0;
+            interne_uren++;
+            if (interne_uren >= 24) interne_uren = 0;
+        }
+    }
+
+    // Elke seconde het display verversen én het proprietary bericht uitsturen
+    if (freerunning_modus)
+        TM1652_DisplayTijd(interne_uren, interne_minuten, 1);
+}
+
+void UART1_SendChar(char c) {
+    uint32_t start_bit;
+    
+    // Live berekening van de exacte bit-duur
+    uint32_t bit_tijd_gekalibreerd = (uint32_t)(gemiddelde_seconde_fixed / 115200000ULL);
+
+    // CRUCIAL FIX: Zet interrupts TIJDELIJK UIT om bit-timing te beschermen
+    __disable_irq();
+
+    // 1. START BIT (LAAG)
+    GPIOD->BSHR = (1 << (5 + 16)); 
+    start_bit = SysTick->CNT;
+    while((SysTick->CNT - start_bit) < bit_tijd_gekalibreerd);
+
+    // 2. DATA BITS (8 stuks, LSB eerst)
+    for (uint8_t i = 0; i < 8; i++) {
+        if (c & 0x01) {
+            GPIOD->BSHR = (1 << 5); 
+        } else {
+            GPIOD->BSHR = (1 << (5 + 16)); 
+        }
+        start_bit += bit_tijd_gekalibreerd;
+        while((SysTick->CNT - start_bit) < bit_tijd_gekalibreerd);
+        c >>= 1;
+    }
+
+    // 3. STOP BIT (HOOG)
+    GPIOD->BSHR = (1 << 5); 
+    start_bit += bit_tijd_gekalibreerd;
+    while((SysTick->CNT - start_bit) < bit_tijd_gekalibreerd);
+    
+    // CRUCIAL FIX: Zet interrupts DIRECT weer AAN
+    __enable_irq();
+
+    // Korte rustpauze tussen karakters (buiten de kritieke interrupt-lock)
+    Delay_us(5);
+}
+
+void UART1_SendChar1(char c) {
+    while((USART1->STATR & USART_STATR_TXE) == 0); // Wacht tot TX-buffer leeg is
+    //USART1->DATAR = c;
+}
+
+void UART1_SendString(char *str) {
+    while(*str) {
+        UART1_SendChar(*str++);
+    }
+}
+
+// Bare-metal functie om een getal zonder printf() over de UART te sturen
+void UART1_SendUint32(uint32_t getal) {
+    char buffer[11];
+    int i = 10;
+    buffer[i] = '\0';
+    
+    if (getal == 0) {
+        UART1_SendChar('0');
+        return;
+    }
+    
+    while (getal > 0 && i > 0) {
+        i--;
+        buffer[i] = (getal % 10) + '0';
+        getal /= 10;
+    }
+    UART1_SendString(&buffer[i]);
+}
+
+
+// ============================================================================
+// HOOFDPROGRAMMA & CORE TIME LOOPS
+// ============================================================================
+
+int main(void) {
+    //SystemInitBareMetal_HSE_24MHz();
+    SystemInitBareMetal_HSI_24MHz();
+
+    SysTick->CTLR = 0x00000005;     
+//    UART1_DetecteerBaudrate();
+    Peripherals_Init();
+   
+    UART1_SendString("NMEA clock\n");
+
+        // Toon de opstart-streepjes
+    TM1652_SendByte(0x08);
+    TM1652_SendByte(0x40); TM1652_SendByte(0x40); TM1652_SendByte(0x40); TM1652_SendByte(0x40);
+    Delay_us(5000);
+    TM1652_SendByte(0x18); TM1652_SendByte(0x1C);
+    UART1_DetecteerBaudrate();
+
+    // Stuur een melding naar de PC dat we succesvol gelockt zijn
+    UART1_SendString("NMEA clock input detected [Auto-Baud]: ");
+    UART1_SendUint32(BaudrateTabel[huidige_baudrate_index]);
+    UART1_SendString(" baud!\r\n");
+
+    start_systick_seconde = SysTick->CNT;
+    laatste_gps_pakket_tijd = SysTick->CNT;
+
+    while(1) {
+        if (nieuwe_tijd_beschikbaar) {
+            Klok_VerwerkGPS();
+        }
+
+        if (!freerunning_modus && (SysTick->CNT - laatste_gps_pakket_tijd) > TIMEOUT_CYCLI) {
+            freerunning_modus = 1; 
+            TM1652_DisplayTijd(interne_uren, interne_minuten, 1);
+        }
+        if( freerunning_modus != freerunning_modus_old) {
+            if(freerunning_modus) 
+                UART1_SendString("clocksource: internal\n");
+            else
+                UART1_SendString("clocksource: NMEA\n");
+            freerunning_modus_old = freerunning_modus;
+        }
+
+        // 50 ms * 24000 cycli per ms = 1.200.000 hardware cycli
+        if (pps_led_actief && (SysTick->CNT - pps_led_start_tijd) >= 1200000) {
+            //GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (LED UIT)
+            GPIOD->BSHR = (1 << 4); // PD4 HOOG (Geïnverteerde LED gaat nu UIT)
+            pps_led_actief = 0;
+        }
+        // 3. Update de tijd autonoom elke seconde
+        if ((SysTick->CNT - start_systick_seconde) >= (uint32_t)(gemiddelde_seconde_fixed / 1000ULL)) {
+            Klok_VerwerkInterneTijd();
+            //UART1_ZendProprietaryData(); 
+        }
+        
+
+        __asm("nop"); 
+    }
+}
