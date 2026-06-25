@@ -412,16 +412,20 @@ void USART1_IRQHandler(void) {
         }
 
         if (nmea_state == 6) {
-            if (c == ',') { komma_teller++; return; }
+            if (c == ',') {
+                komma_teller++;
+                if (komma_teller == 10) {
+                    nieuwe_tijd_beschikbaar = 1; //en datum
+                    nmea_state = 0;
+                }
+            return;
+            }
+
             if (komma_teller == 1) {
                 if (tijd_index < 6) { tijd_buffer[tijd_index++] = c; }
             } 
             else if (komma_teller == 9) {
                 if (datum_index < 6) { datum_buffer[datum_index++] = c; }
-            }
-            if (komma_teller == 2) {  // 10
-                nieuwe_tijd_beschikbaar = 1;
-                nmea_state = 0;
             }
         }
 
@@ -603,9 +607,9 @@ void Klok_VerwerkGPS(void) {
     freerunning_modus = 0; 
     laatste_gps_pakket_tijd = SysTick->CNT; 
 
-    uint8_t gps_u = ((tijd_buffer[0] - '0') * 10) + (tijd_buffer[1] - '0');
-    uint8_t gps_m = ((tijd_buffer[2] - '0') * 10) + (tijd_buffer[3] - '0');
-    uint8_t gps_s = ((tijd_buffer[4] - '0') * 10) + (tijd_buffer[5] - '0');
+    uint8_t gps_u     = ((tijd_buffer[0]  - '0') * 10) + (tijd_buffer[1]  - '0');
+    uint8_t gps_m     = ((tijd_buffer[2]  - '0') * 10) + (tijd_buffer[3]  - '0');
+    uint8_t gps_s     = ((tijd_buffer[4]  - '0') * 10) + (tijd_buffer[5]  - '0');
     uint8_t gps_dag   = ((datum_buffer[0] - '0') * 10) + (datum_buffer[1] - '0');
     uint8_t gps_maand = ((datum_buffer[2] - '0') * 10) + (datum_buffer[3] - '0');
     uint8_t gps_jaar  = ((datum_buffer[4] - '0') * 10) + (datum_buffer[5] - '0');
