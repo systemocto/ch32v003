@@ -297,7 +297,7 @@ void I2C_Slave_Setup(void)
     I2C1->CTLR1 &= ~I2C_CTLR1_SWRST;
 
     // Configureer registers rechtstreeks (omzeil de SPL library)
-    I2C1->CTLR2 = 24;                           // Invoerklok is 24MHz (HSI)
+    I2C1->CTLR2 = 48;                           // Invoerklok is 48MHz (HSI)
     I2C1->OADDR1 = (I2C_SLAVE_ADDRESS << 1);    // 7-bit adres verschuiven naar 0x60
     
     // Schakel NOSTRETCH in om klokgijzeling (deadlocks) te voorkomen
