@@ -9,8 +9,7 @@
 #define BRIGHTNESS  1  // BRIGHTNESS 0 - 7
 #define I2C_SLAVE_ADDRESS 0x30
 #define EEPROM_SIZE 256  // Veranderd van 128 naar 256 bytes
-
-uint8_t  brightness = BRIGHTNESS;
+#define TIMEZONE_OFFSET   0  
 
 // Hulpvariabelen voor de hoofdloop timing
 uint32_t start_systick_seconde;
@@ -20,14 +19,13 @@ uint8_t  freerunning_modus_old = 1;
 uint8_t  dubbelepunt_aan = 1;
 
 const uint32_t EEN_SECONDE_CYCLI = 24000000; 
-const uint32_t TIMEOUT_CYCLI     = 36000000;     
-
-// 1 = UTC+1 (Nederlandse Wintertijd)
-// 2 = UTC+2 (Nederlandse Zomertijd)
-#define TIMEZONE_OFFSET   2  
+const uint32_t EEN_SECONDE_CYCLI48mhz = 48000000; 
+const uint32_t TIMEOUT_CYCLI     = 36000000;
+const uint32_t TIMEOUT_CYCLI48mhz     = 72000000;
 
 // Startwaarde: 24.000.000 * 1000 = 24.000.000.000 (Past perfect in uint32_t of uint64_t)
 volatile uint64_t gemiddelde_seconde_fixed = 24000000000ULL; 
+volatile uint64_t gemiddelde_seconde_fixed48 = 48000000000ULL; 
 volatile uint32_t laatste_gps_systick = 0;
 volatile uint8_t  eerste_sync_gehad = 0;
 
@@ -35,30 +33,27 @@ volatile uint32_t pps_led_start_tijd = 0;
 volatile uint8_t  pps_led_actief = 0;
 
 
-// Directe macro's om de TM1652 datalijn te besturen via het BSHR register
-#define SDA_HIGH()  (GPIOC->BSHR = (1 << TM1652_PIN))
-#define SDA_LOW()   (GPIOC->BSHR = (1 << (TM1652_PIN + 16)))
-
-// Segment-definities voor de cijfers 0 t/m 9 van de TM1652
-const uint8_t CijferTabel[] = {
-    0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f
-};
-
-const uint8_t BrightTabel[] = {
-    0x00, 0x04, 0x02, 0x06, 0x01, 0x05, 0x03, 0x07
-};
-
 // Globale variabelen voor de NMEA parser (gebruikt in de interrupt)
 volatile uint8_t nmea_state = 0;
 volatile uint8_t komma_teller = 0;
 volatile char tijd_buffer[6];
 volatile uint8_t tijd_index = 0;
+volatile char datum_buffer[6];
+volatile uint8_t datum_index = 0;
 volatile uint8_t nieuwe_tijd_beschikbaar = 0;
 
 // Globale variabelen voor de interne vrije klok-engine
 volatile uint8_t interne_uren = 12;   // Standaard opstarttijd 12:00
 volatile uint8_t interne_minuten = 0;
 volatile uint8_t interne_seconden = 0;
+volatile uint8_t interne_dag = 1;   // Standaard opstartdatum 1 jan 2026
+volatile uint8_t interne_maand = 1;
+volatile uint8_t interne_jaar = 26;
+
+
+// Directe macro's om de TM1652 datalijn te besturen via het BSHR register
+#define SDA_HIGH()  (GPIOC->BSHR = (1 << TM1652_PIN))
+#define SDA_LOW()   (GPIOC->BSHR = (1 << (TM1652_PIN + 16)))
 
 // ============================================================================
 // INITIALISATIE & SYSTEEM TIMING
@@ -92,48 +87,43 @@ void SystemInitBareMetal_HSI_24MHz(void) {
     RCC->CFGR0 = 0x00000000; 
 }
 
+void SystemInitBareMetal_HSI_48MHz(void) {
+    // 1. Schakel HSI (24 MHz) in
+    RCC->CTLR |= RCC_HSION;
+    
+    // 2. Wacht tot de HSI stabiel is
+    while((RCC->CTLR & RCC_HSIRDY) == 0);
+
+    // 3. CRUCIAAL VOOR 48 MHz: Flash Latency op 1 Wait State zetten!
+    // Zonder deze regel crasht de processor direct bij de omschakeling naar 48 MHz.
+    FLASH->ACTLR = FLASH_ACTLR_LATENCY_1;
+
+    // 4. Schakel de PLL (multiplier) in om 24 MHz te verdubbelen naar 48 MHz
+    RCC->CTLR |= RCC_PLLON;
+
+    // 5. Wacht tot de PLL stabiel en gelockt is [INDEX]
+    while((RCC->CTLR & RCC_PLLRDY) == 0);
+
+    // 6. Schakel de systeemklok-bron om van HSI (24MHz) naar PLL (48MHz)
+    // Bit 1 inschakelen (RCC_SW_PLL oftewel 0x02) selecteert de PLL [INDEX]
+    RCC->CFGR0 = (RCC->CFGR0 & ~RCC_SW) | RCC_SW_PLL;
+
+    // 7. Wacht tot de hardware bevestigt dat de PLL nu actief is als systeemklok [INDEX]
+    while((RCC->CFGR0 & RCC_SWS) != RCC_SWS_PLL);
+}
+
 /* 
  * Microseconden delay via de SysTick hardware counter
  */
+void Delay_us48mhz(uint32_t us) {
+    uint32_t start = SysTick->CNT;
+    uint32_t cycli = us * 48; // 48 hardware-stappen per microseconde bij 48 MHz
+    while((SysTick->CNT - start) < cycli);
+}
 void Delay_us(uint32_t us) {
     uint32_t start = SysTick->CNT;
     uint32_t cycli = us * 24; // 24 hardware-stappen per microseconde bij 24 MHz
     while((SysTick->CNT - start) < cycli);
-}
-void Peripherals_Init1(void)
-{
-    // 1. Schakel alle benodigde klokken in één keer in
-    RCC->APB2PCENR |= RCC_IOPAEN | RCC_IOPCEN | RCC_IOPDEN | RCC_AFIOEN;
-    RCC->APB2PCENR |= RCC_USART1EN; // Klok voor GPS-USART
-    RCC->APB1PCENR |= RCC_I2C1EN;   // Klok voor Hardware I2C1 (Toegevoegd!)
-
-    // 2. Configureer Poort C pinnen (PC1, PC2 en PC3) tegelijkertijd!
-    // We wissen bits 4 t/m 15 (voor PC1, PC2 en PC3)
-    GPIOC->CFGLR &= ~((0xF << 4) | (0xF << 8) | (0xF << 12));  
-    
-    // We schrijven de exacte modi:
-    // PC1 (SDA) -> 0xC (Alternate Function Open-Drain)
-    // PC2 (SCL) -> 0xC (Alternate Function Open-Drain)
-    // PC3 (Disp)-> 0x3 (Normal Output Push-Pull)
-    GPIOC->CFGLR |=  ((0xC << 4) | (0xC << 8) | (0x3 << 12));   
-    
-    // Maak PC3 direct hoog (idle state voor TM1652 display)
-    SDA_HIGH(); 
-
-    // --- NMEA LOGGING BIT-BANG TX CONFIGURATIE (PD5) ---
-    GPIOD->CFGLR &= ~(0xF << 20);
-    GPIOD->CFGLR |= (0x3 << 20);
-    GPIOD->BSHR = (1 << 5); // PD5 Hoog
-
-    // --- GPS RX CONFIGURATIE (PD6 - Hardware USART1 RX) ---
-    GPIOD->CFGLR &= ~(0xF << 24);
-    GPIOD->CFGLR |= (0x4 << 24);
-
-    // --- HARDWARE USART1 INITIALISATIE ---
-    USART1->CTLR1 = 0;
-    USART1->CTLR2 = 0;
-    USART1->CTLR3 = 0;
-    USART1->CTLR1 |= USART_CTLR1_RE | USART_CTLR1_UE; 
 }
 
 void Peripherals_Init(void) {
@@ -177,6 +167,12 @@ volatile uint8_t huidige_baudrate_index = 0;
 volatile uint8_t baudrate_gevonden = 0;
 
 // Minimale initialisatie van de UART-ontvanger om te kunnen scannen
+void UART1_ScanInit48mhz(uint32_t baudrate) {
+    USART1->CTLR1 &= ~USART_CTLR1_UE;
+    USART1->BRR = (uint16_t)(48000000 / baudrate);
+    // Zet alleen de USART en de ontvanger (RE) aan, nog GEEN interrupts
+    USART1->CTLR1 |= USART_CTLR1_UE | USART_CTLR1_RE; 
+}
 void UART1_ScanInit(uint32_t baudrate) {
     USART1->CTLR1 &= ~USART_CTLR1_UE;
     USART1->BRR = (uint16_t)(24000000 / baudrate);
@@ -224,6 +220,16 @@ void UART1_DetecteerBaudrate(void) {
 // ============================================================================
 // TM1652 DISPLAY PROTOCOL (19200 BAUD, 8O1)
 // ============================================================================
+
+// Segment-definities voor de cijfers 0 t/m 9 van de TM1652
+const uint8_t CijferTabel[] = {
+    0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f
+};
+
+uint8_t  brightness = BRIGHTNESS;
+const uint8_t BrightTabel[] = {
+    0x00, 0x04, 0x02, 0x06, 0x01, 0x05, 0x03, 0x07
+};
 
 /* 
  * Bit-bang functie om 1 byte te verzenden via 19200 Baud met Oneven (ODD) Pariteit
@@ -281,7 +287,7 @@ void TM1652_DisplayTijd(uint8_t u, uint8_t m, uint8_t dp) {
 
 
 // ============================================================================
-// NMEA PARSER & HARDWARE INTERRUPT HANDLER
+// i2c eeprom emulatie
 // ============================================================================
 
 volatile uint8_t i2c_eeprom[EEPROM_SIZE] = {0}; // De virtuele EEPROM in RAM
@@ -383,6 +389,10 @@ void I2C_EEPROM_VulTestpatroon(void)
     }
 }
 
+// ============================================================================
+// NMEA PARSER & HARDWARE INTERRUPT HANDLER
+// ============================================================================
+
 /* 
  * Hardware Interrupt Handler - Verwerkt NMEA op 115200 baud parallel op de achtergrond
  */
@@ -391,20 +401,14 @@ void USART1_IRQHandler(void) {
     if(USART1->STATR & USART_STATR_RXNE) {
         char c = (char)(USART1->DATAR);
 
-        // --- TRANSPARANTE GATEWAY ---
-        // Stuur elke binnengekomen byte van de GPS direct 1-op-1 door naar de PC!
-        //while((USART1->STATR & USART_STATR_TXE) == 0); // Wacht tot TX-buffer vrij is
-        //USART1->DATAR = c;
-        // ----------------------------
-
-        // NMEA Parser State Machine (blijft ongewijzigd op de achtergrond meeluisteren)
+        // NMEA Parser State Machine (Detecteert $xxRMC)
         if (c == '$') { nmea_state = 1; return; }
         if (nmea_state == 1 && c == 'G') { nmea_state = 2; return; }
         if (nmea_state == 2 && (c == 'P' || c == 'N')) { nmea_state = 3; return; }
         if (nmea_state == 3 && c == 'R') { nmea_state = 4; return; }
-        if (nmea_state == 4 && c == 'M') { nmea_state = 5; return; return; }
+        if (nmea_state == 4 && c == 'M') { nmea_state = 5; return; }
         if (nmea_state == 5 && c == 'C') { 
-            nmea_state = 6; komma_teller = 0; tijd_index = 0; return; 
+            nmea_state = 6; komma_teller = 0; tijd_index = 0; datum_index = 0; return; 
         }
 
         if (nmea_state == 6) {
@@ -412,10 +416,22 @@ void USART1_IRQHandler(void) {
             if (komma_teller == 1) {
                 if (tijd_index < 6) { tijd_buffer[tijd_index++] = c; }
             } 
-            else if (komma_teller == 2) {
+            else if (komma_teller == 9) {
+                if (datum_index < 6) { datum_buffer[datum_index++] = c; }
+            }
+            if (komma_teller == 2) {//10
                 nieuwe_tijd_beschikbaar = 1;
                 nmea_state = 0; 
             }
+        }
+
+        static uint8_t nmea_buffer_ptr = 0x20;
+        i2c_eeprom[nmea_buffer_ptr] = (uint8_t)c;
+    
+        // Schuif de pointer op en laat hem loopen binnen het 96-byte bereik
+        nmea_buffer_ptr++;
+        if (nmea_buffer_ptr >= 0x80) {
+            nmea_buffer_ptr = 0x20; 
         }
     }
 }
@@ -494,68 +510,11 @@ void UART1_ZendProprietaryData(void) {
     UART1_SendChar('\n');
 }
 
-void Klok_VerwerkGPS(void) {
-    nieuwe_tijd_beschikbaar = 0;
-    freerunning_modus = 0; 
-    laatste_gps_pakket_tijd = SysTick->CNT; 
-
-    uint8_t gps_u = ((tijd_buffer[0] - '0') * 10) + (tijd_buffer[1] - '0');
-    uint8_t gps_m = ((tijd_buffer[2] - '0') * 10) + (tijd_buffer[3] - '0');
-    uint8_t gps_s = ((tijd_buffer[4] - '0') * 10) + (tijd_buffer[5] - '0');
-
-    if (gps_u < 24 && gps_m < 60 && gps_s < 60) {
-        uint32_t nu_systick = SysTick->CNT;
-        if (eerste_sync_gehad) {
-            uint32_t werkelijke_cycli = nu_systick - laatste_gps_systick;
-            if (werkelijke_cycli > 23900000 && werkelijke_cycli < 24100000) {
-                uint64_t huidige_meting_fixed = (uint64_t)werkelijke_cycli * 1000ULL;
-                if (huidige_meting_fixed > gemiddelde_seconde_fixed) {
-                    gemiddelde_seconde_fixed += (huidige_meting_fixed - gemiddelde_seconde_fixed) >> 10;
-                } else {
-                    gemiddelde_seconde_fixed -= (gemiddelde_seconde_fixed - huidige_meting_fixed) >> 10;
-                }
-            }
-        } else {
-            eerste_sync_gehad = 1;
-        }
-        laatste_gps_systick = nu_systick;
-
-        int8_t lokale_uren = gps_u + TIMEZONE_OFFSET;
-        if (lokale_uren >= 24)      lokale_uren -= 24;
-        else if (lokale_uren < 0)  lokale_uren += 24;
-
-        interne_uren = (uint8_t)lokale_uren;
-        interne_minuten = gps_m;
-        interne_seconden = gps_s;
-        
-        start_systick_seconde = nu_systick; 
-        dubbelepunt_aan = (interne_seconden % 2 == 0);
-        
-        TM1652_DisplayTijd(interne_uren, interne_minuten, dubbelepunt_aan);
-
-        // Start de PPS-flits synchroon met de GPS
-        //GPIOD->BSHR = (1 << 4); // PD4 HOOG (LED AAN)
-        GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (Geïnverteerde LED gaat nu AAN)
-        pps_led_start_tijd = SysTick->CNT;
-        pps_led_actief = 1;
-
-        // Injecteer het proprietary kalibratiebericht
-        UART1_ZendProprietaryData();
-        //UART1_ZendGNRMC();
-    }
-}
-
-// Bare-metal hulpfunctie om een 2-cijferig getal met voorloopnul te zenden (bijv. "05" ipv "5")
-void UART1_Send2Digits(uint8_t getal) {
-    UART1_SendChar((getal / 10) + '0');
-    UART1_SendChar((getal % 10) + '0');
-}
-
 /* 
  * Genereert en zendt een geldige $GNRMC zin op basis van de interne kloktijd
  * Formaat: $GNRMC,hhmmss.00,A,5213.1234,N,00510.1234,E,0.0,0.0,220626,,,A*CS\r\n
  */
-/*
+
 void UART1_ZendGNRMC(void) {
     char nmea_body[80];
     uint8_t checksum = 0;
@@ -579,23 +538,23 @@ void UART1_ZendGNRMC(void) {
     nmea_body[idx++] = 'A';
     nmea_body[idx++] = ',';
     
-    // Fictieve Positie (52°13.1234' N, 005°10.1234' E)
+    // Fictieve Positie (52°13.12345' N, 005°10.12345' E)
     nmea_body[idx++] = '5'; nmea_body[idx++] = '2'; nmea_body[idx++] = '1'; nmea_body[idx++] = '3';
     nmea_body[idx++] = '.'; nmea_body[idx++] = '1'; nmea_body[idx++] = '2'; nmea_body[idx++] = '3';
-    nmea_body[idx++] = '4'; nmea_body[idx++] = ','; nmea_body[idx++] = 'N'; nmea_body[idx++] = ',';
+    nmea_body[idx++] = '4'; nmea_body[idx++] = '5'; nmea_body[idx++] = ','; nmea_body[idx++] = 'N'; nmea_body[idx++] = ',';
     nmea_body[idx++] = '0'; nmea_body[idx++] = '0'; nmea_body[idx++] = '5'; nmea_body[idx++] = '1';
     nmea_body[idx++] = '0'; nmea_body[idx++] = '.'; nmea_body[idx++] = '1'; nmea_body[idx++] = '2';
-    nmea_body[idx++] = '3'; nmea_body[idx++] = '4'; nmea_body[idx++] = ','; nmea_body[idx++] = 'E';
+    nmea_body[idx++] = '3'; nmea_body[idx++] = '4'; nmea_body[idx++] = '5'; nmea_body[idx++] = ','; nmea_body[idx++] = 'E';
     nmea_body[idx++] = ',';
     
     // Snelheid en koers (0.0, 0.0)
     nmea_body[idx++] = '0'; nmea_body[idx++] = '.'; nmea_body[idx++] = '0'; nmea_body[idx++] = ',';
     nmea_body[idx++] = '0'; nmea_body[idx++] = '.'; nmea_body[idx++] = '0'; nmea_body[idx++] = ',';
     
-    // Datum: DDMMYY (Bijvoorbeeld 220626 voor 22 juni 2026)
-    nmea_body[idx++] = '2'; nmea_body[idx++] = '2'; // Dag
-    nmea_body[idx++] = '0'; nmea_body[idx++] = '6'; // Maand
-    nmea_body[idx++] = '2'; nmea_body[idx++] = '6'; // Jaar
+    // Datum: DDMMYY
+    nmea_body[idx++] = (interne_dag / 10) + '0';   nmea_body[idx++] = (interne_dag % 10) + '0';
+    nmea_body[idx++] = (interne_maand / 10) + '0'; nmea_body[idx++] = (interne_maand % 10) + '0';
+    nmea_body[idx++] = (interne_jaar / 10) + '0'; nmea_body[idx++] = (interne_jaar % 10) + '0';
     nmea_body[idx++] = ',';
     
     // Magnetische variatie (leeg)
@@ -631,7 +590,71 @@ void UART1_ZendGNRMC(void) {
     UART1_SendChar('\r');
     UART1_SendChar('\n');
 }
-*/
+
+void Klok_VerwerkGPS(void) {
+    nieuwe_tijd_beschikbaar = 0;
+    freerunning_modus = 0; 
+    laatste_gps_pakket_tijd = SysTick->CNT; 
+
+    uint8_t gps_u = ((tijd_buffer[0] - '0') * 10) + (tijd_buffer[1] - '0');
+    uint8_t gps_m = ((tijd_buffer[2] - '0') * 10) + (tijd_buffer[3] - '0');
+    uint8_t gps_s = ((tijd_buffer[4] - '0') * 10) + (tijd_buffer[5] - '0');
+    uint8_t gps_dag   = ((datum_buffer[0] - '0') * 10) + (datum_buffer[1] - '0');
+    uint8_t gps_maand = ((datum_buffer[2] - '0') * 10) + (datum_buffer[3] - '0');
+    uint8_t gps_jaar  = ((datum_buffer[4] - '0') * 10) + (datum_buffer[5] - '0');
+
+    if (gps_u < 24 && gps_m < 60 && gps_s < 60) {
+        uint32_t nu_systick = SysTick->CNT;
+        if (eerste_sync_gehad) {
+            uint32_t werkelijke_cycli = nu_systick - laatste_gps_systick;
+            if (werkelijke_cycli > 23900000 && werkelijke_cycli < 24100000) {
+//            if (werkelijke_cycli > 47800000 && werkelijke_cycli < 48200000) { 48mhz
+                uint64_t huidige_meting_fixed = (uint64_t)werkelijke_cycli * 1000ULL;
+                if (huidige_meting_fixed > gemiddelde_seconde_fixed) {
+                    gemiddelde_seconde_fixed += (huidige_meting_fixed - gemiddelde_seconde_fixed) >> 10;
+                } else {
+                    gemiddelde_seconde_fixed -= (gemiddelde_seconde_fixed - huidige_meting_fixed) >> 10;
+                }
+            }
+        } else {
+            eerste_sync_gehad = 1;
+        }
+        laatste_gps_systick = nu_systick;
+
+        int8_t lokale_uren = gps_u + TIMEZONE_OFFSET;
+        if (lokale_uren >= 24)      lokale_uren -= 24;
+        else if (lokale_uren < 0)  lokale_uren += 24;
+
+        interne_uren = (uint8_t)lokale_uren;
+        interne_minuten = gps_m;
+        interne_seconden = gps_s;
+        interne_dag = gps_dag;
+        interne_maand = gps_maand;
+        interne_jaar = gps_jaar;
+
+        start_systick_seconde = nu_systick; 
+        dubbelepunt_aan = (interne_seconden % 2 == 0);
+        
+        TM1652_DisplayTijd(interne_uren, interne_minuten, dubbelepunt_aan);
+
+        // Start de PPS-flits synchroon met de GPS
+        //GPIOD->BSHR = (1 << 4); // PD4 HOOG (LED AAN)
+        GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (Geïnverteerde LED gaat nu AAN)
+        pps_led_start_tijd = SysTick->CNT;
+        pps_led_actief = 1;
+
+        // Injecteer het proprietary kalibratiebericht
+        UART1_ZendProprietaryData();
+        UART1_ZendGNRMC();
+    }
+}
+
+// Bare-metal hulpfunctie om een 2-cijferig getal met voorloopnul te zenden (bijv. "05" ipv "5")
+void UART1_Send2Digits(uint8_t getal) {
+    UART1_SendChar((getal / 10) + '0');
+    UART1_SendChar((getal % 10) + '0');
+}
+
 
 void Klok_VerwerkInterneTijd(void) {
     // Schuif de tijd-as op met de dynamisch geleerde fixed-point waarde
@@ -665,7 +688,6 @@ void UART1_SendChar(char c) {
     // Live berekening van de exacte bit-duur
     uint32_t bit_tijd_gekalibreerd = (uint32_t)(gemiddelde_seconde_fixed / 115200000ULL);
 
-    // CRUCIAL FIX: Zet interrupts TIJDELIJK UIT om bit-timing te beschermen
     __disable_irq();
 
     // 1. START BIT (LAAG)
@@ -690,18 +712,18 @@ void UART1_SendChar(char c) {
     start_bit += bit_tijd_gekalibreerd;
     while((SysTick->CNT - start_bit) < bit_tijd_gekalibreerd);
     
-    // CRUCIAL FIX: Zet interrupts DIRECT weer AAN
     __enable_irq();
 
     // Korte rustpauze tussen karakters (buiten de kritieke interrupt-lock)
     Delay_us(5);
 }
 
+/*
 void UART1_SendChar1(char c) {
     while((USART1->STATR & USART_STATR_TXE) == 0); // Wacht tot TX-buffer leeg is
     //USART1->DATAR = c;
 }
-
+*/
 void UART1_SendString(char *str) {
     while(*str) {
         UART1_SendChar(*str++);
@@ -734,7 +756,9 @@ void UART1_SendUint32(uint32_t getal) {
 
 int main(void) {
     //SystemInitBareMetal_HSE_24MHz();
-    SystemInitBareMetal_HSI_24MHz();
+  SystemInitBareMetal_HSI_24MHz();
+//    SystemInitBareMetal_HSI_48MHz();
+
 
     SysTick->CTLR = 0x00000005;     
     Peripherals_Init();
@@ -776,6 +800,7 @@ int main(void) {
         }
 
         // 50 ms * 24000 cycli per ms = 1.200.000 hardware cycli
+        // gemiddelde_seconde_fixed
         if (pps_led_actief && (SysTick->CNT - pps_led_start_tijd) >= 1200000) {
             //GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (LED UIT)
             GPIOD->BSHR = (1 << 4); // PD4 HOOG (Geïnverteerde LED gaat nu UIT)
@@ -787,8 +812,14 @@ int main(void) {
             //UART1_ZendProprietaryData(); 
         }
         
-            i2c_eeprom[0x10] = interne_uren;
+    // Schrijf de gepurste data live weg naar de I2C registers
+    i2c_eeprom[0x10] = interne_uren;
     i2c_eeprom[0x11] = interne_minuten;
+    i2c_eeprom[0x12] = interne_seconden;
+    i2c_eeprom[0x14] = interne_dag;
+    i2c_eeprom[0x15] = interne_maand;
+    i2c_eeprom[0x16] = interne_jaar;
+
 //    brightness = i2c_eeprom[0x00]; 
     I2C_EEPROM_VerwerkPolling();
 
