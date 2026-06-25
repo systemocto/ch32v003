@@ -419,9 +419,9 @@ void USART1_IRQHandler(void) {
             else if (komma_teller == 9) {
                 if (datum_index < 6) { datum_buffer[datum_index++] = c; }
             }
-            if (komma_teller == 2) {//10
+            if (komma_teller == 2) {  // 10
                 nieuwe_tijd_beschikbaar = 1;
-                nmea_state = 0; 
+                nmea_state = 0;
             }
         }
 
@@ -557,11 +557,18 @@ void UART1_ZendGNRMC(void) {
     nmea_body[idx++] = (interne_jaar / 10) + '0'; nmea_body[idx++] = (interne_jaar % 10) + '0';
     nmea_body[idx++] = ',';
     
+//
+    nmea_body[idx++] = ',';
+
+    
     // Magnetische variatie (leeg)
     nmea_body[idx++] = ',';
     
     // Mode indicator: A = Autonomous
     nmea_body[idx++] = 'A';
+
+nmea_body[idx++] = ',';
+nmea_body[idx++] = 'V'; // not valid
 
     // --- CHECKSUM BEREKENING ---
     // XOR alle karakters in de buffer met elkaar
@@ -655,7 +662,6 @@ void UART1_Send2Digits(uint8_t getal) {
     UART1_SendChar((getal % 10) + '0');
 }
 
-
 void Klok_VerwerkInterneTijd(void) {
     // Schuif de tijd-as op met de dynamisch geleerde fixed-point waarde
     start_systick_seconde += (uint32_t)(gemiddelde_seconde_fixed / 1000ULL);
@@ -673,9 +679,44 @@ void Klok_VerwerkInterneTijd(void) {
         if (interne_minuten >= 60) {
             interne_minuten = 0;
             interne_uren++;
-            if (interne_uren >= 24) interne_uren = 0;
+            if (interne_uren >= 24) {
+                interne_uren = 0;
+                
+                interne_dag++;
+                
+                // Bepaal het maximaal aantal dagen in de huidige maand
+                uint8_t max_dagen = 31;
+                
+                if (interne_maand == 4 || interne_maand == 6 || interne_maand == 9 || interne_maand == 11) {
+                    max_dagen = 30; // April, Juni, September, November
+                } 
+                else if (interne_maand == 2) {
+                    // Schrikkeljaar controle (de CH32V003 draait tussen 2000 en 2099)
+                    // Als het jaartal deelbaar is door 4, heeft februari 29 dagen
+                    if ((interne_jaar % 4) == 0) {
+                        max_dagen = 29;
+                    } else {
+                        max_dagen = 28;
+                    }
+                }
+                
+                // Controleer of we de maandgrens overschrijden
+                if (interne_dag > max_dagen) {
+                    interne_dag = 1;      // Reset naar de 1e van de nieuwe maand
+                    interne_maand++;       // Volgende maand
+                    
+                    // Controleer of we de jaargrens overschrijden
+                    if (interne_maand > 12) {
+                        interne_maand = 1; // Reset naar Januari
+                        interne_jaar++;    // Volgende jaar
+                    }
+                }
+            }
         }
     }
+
+
+
 
     // Elke seconde het display verversen én het proprietary bericht uitsturen
     if (freerunning_modus)
@@ -800,7 +841,6 @@ int main(void) {
         }
 
         // 50 ms * 24000 cycli per ms = 1.200.000 hardware cycli
-        // gemiddelde_seconde_fixed
         if (pps_led_actief && (SysTick->CNT - pps_led_start_tijd) >= 1200000) {
             //GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (LED UIT)
             GPIOD->BSHR = (1 << 4); // PD4 HOOG (Geïnverteerde LED gaat nu UIT)
