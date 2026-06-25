@@ -10,9 +10,10 @@
 #define I2C_SLAVE_ADDRESS 0x30
 #define PCF9557_ADDRESS 0x18
 #define TMP102_ADDRESS 0x4A
+#define TIMEZONE_OFFSET   0  
 
 #define EEPROM_SIZE 256  // Veranderd van 128 naar 256 bytes
-#define TIMEZONE_OFFSET   0  
+volatile uint8_t i2c_eeprom[EEPROM_SIZE] = {0}; // De virtuele EEPROM in RAM
 
 // Hulpvariabelen voor de hoofdloop timing
 uint32_t start_systick_seconde;
@@ -23,13 +24,13 @@ uint8_t  dubbelepunt_aan = 1;
 uint8_t  dipsw = 0;
 
 const uint32_t EEN_SECONDE_CYCLI = 24000000; 
-const uint32_t EEN_SECONDE_CYCLI48mhz = 48000000; 
+//const uint32_t EEN_SECONDE_CYCLI48mhz = 48000000; 
 const uint32_t TIMEOUT_CYCLI     = 36000000;
-const uint32_t TIMEOUT_CYCLI48mhz     = 72000000;
+//const uint32_t TIMEOUT_CYCLI48mhz     = 72000000;
 
 // Startwaarde: 24.000.000 * 1000 = 24.000.000.000 (Past perfect in uint32_t of uint64_t)
-volatile uint64_t gemiddelde_seconde_fixed = 24000000000ULL; 
-volatile uint64_t gemiddelde_seconde_fixed48 = 48000000000ULL; 
+//volatile uint64_t gemiddelde_seconde_fixed = 24000000000ULL; 
+volatile uint64_t gemiddelde_seconde_fixed = EEN_SECONDE_CYCLI * 1000ULL; 
 volatile uint32_t laatste_gps_systick = 0;
 volatile uint8_t  eerste_sync_gehad = 0;
 
@@ -45,6 +46,7 @@ volatile uint8_t tijd_index = 0;
 volatile char datum_buffer[6];
 volatile uint8_t datum_index = 0;
 volatile uint8_t nieuwe_tijd_beschikbaar = 0;
+volatile int8_t tijdzone_offset = TIMEZONE_OFFSET; // Standaard +1 (Amsterdam)
 
 // Globale variabelen voor de interne vrije klok-engine
 volatile uint8_t interne_uren = 12;   // Standaard opstarttijd 12:00
@@ -119,14 +121,10 @@ void SystemInitBareMetal_HSI_48MHz(void) {
 /* 
  * Microseconden delay via de SysTick hardware counter
  */
-void Delay_us48mhz(uint32_t us) {
-    uint32_t start = SysTick->CNT;
-    uint32_t cycli = us * 48; // 48 hardware-stappen per microseconde bij 48 MHz
-    while((SysTick->CNT - start) < cycli);
-}
 void Delay_us(uint32_t us) {
     uint32_t start = SysTick->CNT;
-    uint32_t cycli = us * 24; // 24 hardware-stappen per microseconde bij 24 MHz
+//    uint32_t cycli = us * 24; // 24 hardware-stappen per microseconde bij 24 MHz
+    uint32_t cycli = us * (EEN_SECONDE_CYCLI/1000000); // 24 hardware-stappen per microseconde bij 24 MHz
     while((SysTick->CNT - start) < cycli);
 }
 
@@ -164,22 +162,16 @@ void Peripherals_Init(void) {
     SysTick->CTLR = 0x00000005; 
 }
 
-const uint32_t BaudrateTabel[] = {115200, 57600, 38400, 19200, 9600, 4800};
-#define AANTAL_BAUDRATES (sizeof(BaudrateTabel) / sizeof(BaudrateTabel))
+const uint32_t BaudrateTabel[] = {115200, 38400, 19200, 9600, 4800, 57600};
+#define AANTAL_BAUDRATES (sizeof(BaudrateTabel) / sizeof(BaudrateTabel[0]))
 
 volatile uint8_t huidige_baudrate_index = 0;
 volatile uint8_t baudrate_gevonden = 0;
 
 // Minimale initialisatie van de UART-ontvanger om te kunnen scannen
-void UART1_ScanInit48mhz(uint32_t baudrate) {
-    USART1->CTLR1 &= ~USART_CTLR1_UE;
-    USART1->BRR = (uint16_t)(48000000 / baudrate);
-    // Zet alleen de USART en de ontvanger (RE) aan, nog GEEN interrupts
-    USART1->CTLR1 |= USART_CTLR1_UE | USART_CTLR1_RE; 
-}
 void UART1_ScanInit(uint32_t baudrate) {
     USART1->CTLR1 &= ~USART_CTLR1_UE;
-    USART1->BRR = (uint16_t)(24000000 / baudrate);
+    USART1->BRR = (uint16_t)(EEN_SECONDE_CYCLI / baudrate);
     // Zet alleen de USART en de ontvanger (RE) aan, nog GEEN interrupts
     USART1->CTLR1 |= USART_CTLR1_UE | USART_CTLR1_RE; 
 }
@@ -286,15 +278,15 @@ void TM1652_DisplayTijd(uint8_t u, uint8_t m, uint8_t dp) {
 
     Delay_us(500);
     TM1652_SendByte(0x18); // Adres voor Helderheid/Mode regeling
-    TM1652_SendByte(0x18 + (BrightTabel[brightness] & 0x07) << 1); // Display AAN, Mode 8x5, Helderheid level <brightness>
+//    TM1652_SendByte(0x18 + (BrightTabel[brightness] & 0x07) << 1); // Display AAN, Mode 8x5, Helderheid level <brightness>
+    TM1652_SendByte(0x18 + ((BrightTabel[brightness] & 0x07) << 1)); // Display AAN, Mode 8x5, Helderheid level <brightness>
+//    TM1652_SendByte(0x1c);        
 }
 
 
 // ============================================================================
 // i2c eeprom emulatie
 // ============================================================================
-
-volatile uint8_t i2c_eeprom[EEPROM_SIZE] = {0}; // De virtuele EEPROM in RAM
 
 // Statusvariabelen voor de I2C state-machine
 volatile uint8_t i2c_reg_pointer = 0;   // Wijst naar het huidige virtuele EEPROM-adres
@@ -524,6 +516,50 @@ int32_t TMP102_LeesMillidegrees(void)
 // NMEA PARSER & HARDWARE INTERRUPT HANDLER
 // ============================================================================
 
+void UART1_SendChar(char c) {
+    uint32_t start_bit;
+    
+    // Live berekening van de exacte bit-duur
+    uint32_t bit_tijd_gekalibreerd = (uint32_t)(gemiddelde_seconde_fixed / 115200000ULL);
+
+    __disable_irq();
+
+    // 1. START BIT (LAAG)
+    GPIOD->BSHR = (1 << (5 + 16)); 
+    start_bit = SysTick->CNT;
+    while((SysTick->CNT - start_bit) < bit_tijd_gekalibreerd);
+
+    // 2. DATA BITS (8 stuks, LSB eerst)
+    for (uint8_t i = 0; i < 8; i++) {
+        if (c & 0x01) {
+            GPIOD->BSHR = (1 << 5); 
+        } else {
+            GPIOD->BSHR = (1 << (5 + 16)); 
+        }
+        start_bit += bit_tijd_gekalibreerd;
+        while((SysTick->CNT - start_bit) < bit_tijd_gekalibreerd);
+        c >>= 1;
+    }
+
+    // 3. STOP BIT (HOOG)
+    GPIOD->BSHR = (1 << 5); 
+    start_bit += bit_tijd_gekalibreerd;
+    while((SysTick->CNT - start_bit) < bit_tijd_gekalibreerd);
+    
+    __enable_irq();
+
+    // Korte rustpauze tussen karakters (buiten de kritieke interrupt-lock)
+    Delay_us(5);
+}
+
+/*
+void UART1_SendChar1(char c) {
+    while((USART1->STATR & USART_STATR_TXE) == 0); // Wacht tot TX-buffer leeg is
+    //USART1->DATAR = c;
+}
+*/
+
+
 /* 
  * Hardware Interrupt Handler - Verwerkt NMEA op 115200 baud parallel op de achtergrond
  */
@@ -656,7 +692,6 @@ void UART1_ZendProprietaryData(void) {
  * Genereert en zendt een geldige $GNRMC zin op basis van de interne kloktijd
  * Formaat: $GNRMC,hhmmss.00,A,5213.1234,N,00510.1234,E,0.0,0.0,220626,,,A*CS\r\n
  */
-
 void UART1_ZendGNRMC(void) {
     char nmea_body[80];
     uint8_t checksum = 0;
@@ -677,8 +712,9 @@ void UART1_ZendGNRMC(void) {
     nmea_body[idx++] = '.'; nmea_body[idx++] = '0'; nmea_body[idx++] = '0';
     nmea_body[idx++] = ',';
     
-    // Status: A = Valid (Geldige fix)
-    nmea_body[idx++] = 'A';
+    // Status: A = Valid (Geldige fix), V = invalid
+//    nmea_body[idx++] = 'A';
+    nmea_body[idx++] = freerunning_modus ? 'V': 'A';
     nmea_body[idx++] = ',';
     
     // Fictieve Positie (52°13.12345' N, 005°10.12345' E)
@@ -700,25 +736,24 @@ void UART1_ZendGNRMC(void) {
     nmea_body[idx++] = (interne_jaar / 10) + '0'; nmea_body[idx++] = (interne_jaar % 10) + '0';
     nmea_body[idx++] = ',';
     
-//
     nmea_body[idx++] = ',';
-
     
     // Magnetische variatie (leeg)
     nmea_body[idx++] = ',';
     
-    // Mode indicator: A = Autonomous
-    nmea_body[idx++] = 'A';
+    // NMEA 2.3+ Mode indicator: A = Autonomous
+    nmea_body[idx++] = freerunning_modus ? 'N': 'A';
+    nmea_body[idx++] = ',';
+    nmea_body[idx++] = ',';
 
-nmea_body[idx++] = ',';
-nmea_body[idx++] = 'V'; // not valid
+    // NMEA 4.10 Navigational Status: V =  Not Valid
+    nmea_body[idx++] = 'V';
 
     // --- CHECKSUM BEREKENING ---
     // XOR alle karakters in de buffer met elkaar
     for (int i = 0; i < idx; i++) {
         checksum ^= nmea_body[i];
     }
-
 
     nmea_buffer_ptr = 0x20;
     for (int i = 0; i < idx; i++) {
@@ -783,7 +818,7 @@ void Klok_VerwerkGPS(void) {
         }
         laatste_gps_systick = nu_systick;
 
-        int8_t lokale_uren = gps_u + TIMEZONE_OFFSET;
+        int8_t lokale_uren = gps_u + tijdzone_offset;
         if (lokale_uren >= 24)      lokale_uren -= 24;
         else if (lokale_uren < 0)  lokale_uren += 24;
 
@@ -871,56 +906,15 @@ void Klok_VerwerkInterneTijd(void) {
         }
     }
 
-
-
-
     // Elke seconde het display verversen én het proprietary bericht uitsturen
-    if (freerunning_modus)
+    if (freerunning_modus) {
         TM1652_DisplayTijd(interne_uren, interne_minuten, 1);
-}
+        UART1_ZendProprietaryData();
+        UART1_ZendGNRMC();
 
-void UART1_SendChar(char c) {
-    uint32_t start_bit;
-    
-    // Live berekening van de exacte bit-duur
-    uint32_t bit_tijd_gekalibreerd = (uint32_t)(gemiddelde_seconde_fixed / 115200000ULL);
-
-    __disable_irq();
-
-    // 1. START BIT (LAAG)
-    GPIOD->BSHR = (1 << (5 + 16)); 
-    start_bit = SysTick->CNT;
-    while((SysTick->CNT - start_bit) < bit_tijd_gekalibreerd);
-
-    // 2. DATA BITS (8 stuks, LSB eerst)
-    for (uint8_t i = 0; i < 8; i++) {
-        if (c & 0x01) {
-            GPIOD->BSHR = (1 << 5); 
-        } else {
-            GPIOD->BSHR = (1 << (5 + 16)); 
-        }
-        start_bit += bit_tijd_gekalibreerd;
-        while((SysTick->CNT - start_bit) < bit_tijd_gekalibreerd);
-        c >>= 1;
     }
-
-    // 3. STOP BIT (HOOG)
-    GPIOD->BSHR = (1 << 5); 
-    start_bit += bit_tijd_gekalibreerd;
-    while((SysTick->CNT - start_bit) < bit_tijd_gekalibreerd);
-    
-    __enable_irq();
-
-    // Korte rustpauze tussen karakters (buiten de kritieke interrupt-lock)
-    Delay_us(5);
 }
 
-/*
-void UART1_SendChar1(char c) {
-    while((USART1->STATR & USART_STATR_TXE) == 0); // Wacht tot TX-buffer leeg is
-    //USART1->DATAR = c;
-}
-*/
 void UART1_SendString(char *str) {
     while(*str) {
         UART1_SendChar(*str++);
@@ -962,8 +956,17 @@ int main(void) {
     Peripherals_Init();
     Pure_Hardware_I2C_Slave_Init();
 //    I2C_EEPROM_VulTestpatroon();
-   
-    UART1_SendString("NMEA clock\n");
+    i2c_eeprom[0x00] = BRIGHTNESS;
+    i2c_eeprom[0x17] = (uint8_t)tijdzone_offset; // Cast naar uint8_t voor de array
+
+    // Register 0x03 is Configuration. Waarde 0xF0 = 1111 0000 (Bit 0,1,2,3 = Output, rest = Input)
+    PCF9557_WriteRegister(0x03, 0xF0);
+    PCF9557_WriteRegister(0x01, 0x0f);
+    dipsw = PCF9557_LeesHogeBits();
+
+    UART1_SendString("NMEA clock ID:");
+    UART1_SendUint32(dipsw);
+    UART1_SendString("\r\n");
 
         // Toon de opstart-streepjes
     TM1652_SendByte(0x08);
@@ -980,10 +983,6 @@ int main(void) {
     start_systick_seconde = SysTick->CNT;
     laatste_gps_pakket_tijd = SysTick->CNT;
 
-    // Register 0x03 is Configuration. Waarde 0xF0 = 1111 0000 (Bit 0,1,2,3 = Output, rest = Input)
-    PCF9557_WriteRegister(0x03, 0xF0);
-    PCF9557_WriteRegister(0x01, 0x0f);
-    dipsw = PCF9557_LeesHogeBits();
 
     while(1) {
         if (nieuwe_tijd_beschikbaar) {
@@ -996,9 +995,9 @@ int main(void) {
         }
         if( freerunning_modus != freerunning_modus_old) {
             if(freerunning_modus) 
-                UART1_SendString("clocksource: internal\n");
+                UART1_SendString("clocksource: internal\r\n");
             else
-                UART1_SendString("clocksource: NMEA\n");
+                UART1_SendString("clocksource: NMEA\r\n");
             freerunning_modus_old = freerunning_modus;
         }
 
@@ -1019,16 +1018,12 @@ int main(void) {
             i2c_eeprom[0x1C] = (uint8_t)((mdeg >> 16) & 0xFF); // Hoogste byte (Bits 16-23)
             i2c_eeprom[0x1D] = (uint8_t)((mdeg >> 8)  & 0xFF); // Middelste byte (Bits 8-15)
             i2c_eeprom[0x1E] = (uint8_t)(mdeg         & 0xFF); // Laagste byte  (Bits 0-7)
-
         }
         // 3. Update de tijd autonoom elke seconde
         if ((SysTick->CNT - start_systick_seconde) >= (uint32_t)(gemiddelde_seconde_fixed / 1000ULL)) {
             Klok_VerwerkInterneTijd();
-
-            //UART1_ZendProprietaryData(); 
         }
         
-    // Schrijf de gepurste data live weg naar de I2C registers
     i2c_eeprom[0x10] = interne_uren;
     i2c_eeprom[0x11] = interne_minuten;
     i2c_eeprom[0x12] = interne_seconden;
@@ -1036,12 +1031,11 @@ int main(void) {
     i2c_eeprom[0x15] = interne_maand;
     i2c_eeprom[0x16] = interne_jaar;
 
-// Binnen de while(1) loop van main():
 
     
  
-
-//    brightness = i2c_eeprom[0x00]; 
+    tijdzone_offset = (int8_t) i2c_eeprom[0x17];
+    brightness = i2c_eeprom[0x00]; 
     I2C_EEPROM_VerwerkPolling();
 
 
