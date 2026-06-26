@@ -13,6 +13,8 @@
 #define TIMEZONE_OFFSET   0  
 #define LTC_GPIO_PORT      GPIOD
 #define LTC_PIN            3      // Kies een vrije pin, bijv. PD3
+#define IRIG_GPIO_PORT     GPIOD
+#define IRIG_PIN           2      // Kies een vrije pin, bijv. PD2 voor IRIG-B output
 
 #define EEPROM_SIZE 256  // Veranderd van 128 naar 256 bytes
 volatile uint8_t i2c_eeprom[EEPROM_SIZE] = {0}; // De virtuele EEPROM in RAM
@@ -73,9 +75,12 @@ volatile uint8_t ltc_sub_bit = 0;      // 0 = start van bit, 1 = midden (voor bi
 volatile uint8_t ltc_huidige_bit = 0;
 volatile uint8_t ltc_output_state = 0;
 volatile uint8_t ltc_stap_teller = 0; // Loopt van 0 tot 159 (80 bits * 2 stappen)
-
-
 void LTC_BouwFrame(uint8_t u, uint8_t m, uint8_t s, uint8_t f);
+
+volatile uint8_t irig_bits[100] = {0}; // Buffer voor 100 IRIG-bits per seconde
+volatile uint8_t irig_bit_index = 0;   // Huidige bit (0 t/m 99)
+volatile uint8_t irig_tick_counter = 0; // Telt interrupts binnen de 10ms bit (0 t/m 39)
+void IRIG_BouwFrame(uint8_t u, uint8_t m, uint8_t s);
 
 // ============================================================================
 // INITIALISATIE & SYSTEEM TIMING
@@ -1142,12 +1147,48 @@ void TIM2_IRQHandler(void) {
                     }
                 }
             }
+            // --- VERVERS IRIG-B STREAM VOOR DE NIEUWE SECONDE ---
+            IRIG_BouwFrame(interne_uren, interne_minuten, interne_seconden);
+            irig_bit_index = 0; // Synchroniseer de IRIG bit-as strak met de LTC-as
+            irig_tick_counter = 0;
+
         }
         
         // Bouw direct het nieuwe frame op op de achtergrond
         LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, interne_frames);
 
     }
+
+
+        // ========================================================================
+    // IRIG-B GENERATOR ENGINE (Elke interrupt = 250 us)
+    // ========================================================================
+    uint8_t huidige_irig_type = irig_bits[irig_bit_index];
+    uint8_t irig_hoog_grens = 8; // Standaard Bit '0': 2 ms hoog = 8 ticks * 250us
+
+    if (huidige_irig_type == 1) {
+        irig_hoog_grens = 20;    // Bit '1': 5 ms hoog = 20 ticks
+    } else if (huidige_irig_type == 2) {
+        irig_hoog_grens = 32;    // Sync Marker (P): 8 ms hoog = 32 ticks
+    }
+
+    // PWM Schakelmomenten uitvoeren op PD2
+    if (irig_tick_counter < irig_hoog_grens) {
+        IRIG_GPIO_PORT->BSHR = (1 << IRIG_PIN);        // Pin HOOG
+    } else {
+        IRIG_GPIO_PORT->BSHR = (1 << (IRIG_PIN + 16)); // Pin LAAG
+    }
+
+    irig_tick_counter++;
+    if (irig_tick_counter >= 40) { // 40 ticks * 250us = 10 ms voorbij. Volgende bit!
+        irig_tick_counter = 0;
+        irig_bit_index++;
+        if (irig_bit_index >= 100) {
+            irig_bit_index = 0; // 100 bits = 1 seconde voorbij
+        }
+    }
+    // ========================================================================
+
 }
 
 void TIM2_IRQHandler1(void) {
@@ -1195,6 +1236,56 @@ void TIM2_IRQHandler1(void) {
     }
 }
 
+    // ========================================================================
+    // IRIG-B GENERATOR ENGINE (Elke interrupt = 250 us)
+    // ========================================================================
+
+void IRIG_Init(void) {
+    // Configureer ook PD5 als Output Push-Pull voor IRIG-B
+    GPIOD->CFGLR &= ~(0xF << (IRIG_PIN * 4)); 
+    GPIOD->CFGLR |= (0x3 << (IRIG_PIN * 4));  
+}
+
+void IRIG_BouwFrame(uint8_t u, uint8_t m, uint8_t s) {
+    // 1. Wis de bitstream (alles op '0')
+    for(uint8_t i = 0; i < 100; i++) irig_bits[i] = 0;
+
+    // 2. Plaats de verplichte Position Identifiers (8ms pulsen) volgens de IRIG-B standaard
+    irig_bits[0]  = 2; // P0 (Start van frame)
+    irig_bits[9]  = 2; // P1
+    irig_bits[19] = 2; // P2
+    irig_bits[29] = 2; // P3
+    irig_bits[39] = 2; // P4
+    irig_bits[49] = 2; // P5
+    irig_bits[59] = 2; // P6
+    irig_bits[69] = 2; // P7
+    irig_bits[79] = 2; // P8
+    irig_bits[89] = 2; // P9
+    irig_bits[99] = 2; // P5 (Laatste bit voor de omslag)
+
+    // 3. Codeer Seconden (Bits 1-4 eenheden, Bits 6-8 tientallen)
+    uint8_t s_een = s % 10; uint8_t s_tien = s / 10;
+    if(s_een & 0x01) irig_bits[1] = 1; if(s_een & 0x02) irig_bits[2] = 1;
+    if(s_een & 0x04) irig_bits[3] = 1; if(s_een & 0x08) irig_bits[4] = 1;
+    if(s_tien & 0x01) irig_bits[5] = 1; if(s_tien & 0x02) irig_bits[6] = 1;
+    if(s_tien & 0x04) irig_bits[7] = 1;
+
+    // 4. Codeer Minuten (Bits 10-13 eenheden, Bits 15-17 tientallen)
+    uint8_t m_een = m % 10; uint8_t m_tien = m / 10;
+    if(m_een & 0x01) irig_bits[10] = 1; if(m_een & 0x02) irig_bits[11] = 1;
+    if(m_een & 0x04) irig_bits[12] = 1; if(m_een & 0x08) irig_bits[13] = 1;
+    if(m_tien & 0x01) irig_bits[15] = 1; if(m_tien & 0x02) irig_bits[16] = 1;
+    if(m_tien & 0x04) irig_bits[17] = 1;
+
+    // 5. Codeer Uren (Bits 20-23 eenheden, Bits 25-26 tientallen)
+    uint8_t u_een = u % 10; uint8_t u_tien = u / 10;
+    if(u_een & 0x01) irig_bits[20] = 1; if(u_een & 0x02) irig_bits[21] = 1;
+    if(u_een & 0x04) irig_bits[22] = 1; if(u_een & 0x08) irig_bits[23] = 1;
+    if(u_tien & 0x01) irig_bits[25] = 1; if(u_tien & 0x02) irig_bits[26] = 1;
+}
+
+
+
 // ============================================================================
 // HOOFDPROGRAMMA & CORE TIME LOOPS
 // ============================================================================
@@ -1234,6 +1325,7 @@ int main(void) {
     UART1_SendString(" baud!\r\n");
 
     LTC_Timer_Init();
+    IRIG_Init();
     start_systick_seconde = SysTick->CNT;
     laatste_gps_pakket_tijd = SysTick->CNT;
     start_systick_frame = SysTick->CNT;
