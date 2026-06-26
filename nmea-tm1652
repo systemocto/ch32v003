@@ -27,12 +27,13 @@ uint8_t  dipsw = 0;
 
 volatile uint8_t interne_frames = 0;
 uint32_t start_systick_frame = 0;
-const uint32_t EEN_FRAME_CYCLI = 24000000 / 25; // 960.000 hardware ticks per frame bij 24 MHz
+//const uint32_t EEN_FRAME_CYCLI = 24000000 / 25; // 960.000 hardware ticks per frame bij 24 MHz
+const uint32_t EEN_FRAME_CYCLI = 48000000 / 25; // 960.000 hardware ticks per frame bij 48 MHz
 
-const uint32_t EEN_SECONDE_CYCLI = 24000000; 
-//const uint32_t EEN_SECONDE_CYCLI48mhz = 48000000; 
-const uint32_t TIMEOUT_CYCLI     = 36000000;
-//const uint32_t TIMEOUT_CYCLI48mhz     = 72000000;
+//const uint32_t EEN_SECONDE_CYCLI = 24000000; 
+const uint32_t EEN_SECONDE_CYCLI = 48000000; //
+//const uint32_t TIMEOUT_CYCLI     = 36000000;
+const uint32_t TIMEOUT_CYCLI     = 72000000;
 
 // Startwaarde: 24.000.000 * 1000 = 24.000.000.000 (Past perfect in uint32_t of uint64_t)
 //volatile uint64_t gemiddelde_seconde_fixed = 24000000000ULL; 
@@ -119,6 +120,8 @@ void SystemInitBareMetal_HSI_48MHz(void) {
     // Zonder deze regel crasht de processor direct bij de omschakeling naar 48 MHz.
     FLASH->ACTLR = FLASH_ACTLR_LATENCY_1;
 
+RCC->CFGR0 &= ~(0x000007F0); 
+
     // 4. Schakel de PLL (multiplier) in om 24 MHz te verdubbelen naar 48 MHz
     RCC->CTLR |= RCC_PLLON;
 
@@ -177,7 +180,7 @@ void Peripherals_Init(void) {
     SysTick->CTLR = 0x00000005; 
 }
 
-const uint32_t BaudrateTabel[] = {115200, 38400, 19200, 9600, 4800, 57600};
+const uint32_t BaudrateTabel[] = {230400, 115200, 38400, 19200, 9600, 4800, 57600};
 #define AANTAL_BAUDRATES (sizeof(BaudrateTabel) / sizeof(BaudrateTabel[0]))
 
 volatile uint8_t huidige_baudrate_index = 0;
@@ -186,7 +189,8 @@ volatile uint8_t baudrate_gevonden = 0;
 // Minimale initialisatie van de UART-ontvanger om te kunnen scannen
 void UART1_ScanInit(uint32_t baudrate) {
     USART1->CTLR1 &= ~USART_CTLR1_UE;
-    USART1->BRR = (uint16_t)(EEN_SECONDE_CYCLI / baudrate);
+    //USART1->BRR = (uint16_t)(EEN_SECONDE_CYCLI / baudrate);
+    USART1->BRR = (uint16_t)(48000000 / baudrate);
     // Zet alleen de USART en de ontvanger (RE) aan, nog GEEN interrupts
     USART1->CTLR1 |= USART_CTLR1_UE | USART_CTLR1_RE; 
 }
@@ -205,7 +209,8 @@ void UART1_DetecteerBaudrate(void) {
         
         // Wacht maximaal 1,5 seconde op deze baudrate om een '$' te spotten
         start_tijd = SysTick->CNT;
-        const uint32_t ANDERHALVE_SECONDE = 36000000;
+//        const uint32_t ANDERHALVE_SECONDE = 36000000;
+        const uint32_t ANDERHALVE_SECONDE = 72000000;
         
         while ((SysTick->CNT - start_tijd) < ANDERHALVE_SECONDE) {
             // Controleer of er een byte klaarstaat in het hardware register
@@ -1000,7 +1005,11 @@ void LTC_Timer_Init(void) {
 
     // 3. TIM2 instellen voor 4000 Hz interrupt (250 us bij 24 MHz)
     TIM_TimeBaseStructure.TIM_Period = 250 - 1;
-    TIM_TimeBaseStructure.TIM_Prescaler = 24 - 1;
+    //TIM_TimeBaseStructure.TIM_Prescaler = 24 - 1;
+//    TIM_TimeBaseStructure.TIM_Prescaler = 48 - 1;   // 48 MHz / 48 = 1 MHz (1 tick = 1 us)
+    TIM_TimeBaseStructure.TIM_Prescaler = (EEN_SECONDE_CYCLI / 1000000) - 1;
+
+
     TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
     TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
     TIM_TimeBaseInit(TIM2, &TIM_TimeBaseStructure);
@@ -1118,9 +1127,21 @@ void TIM2_IRQHandler(void) {
         ltc_stap_teller = 0; // Frame compleet, begin opnieuw bij bit 0
 
         interne_frames++;
+
         if (interne_frames >= 25) {
-            // We resetten de frames niet hardcoded hier, 
-            // dat mag de seconde-puls zo dadelijk doen!
+            interne_frames = 0;
+//            interne_seconden++;
+            if (interne_seconden >= 60) {
+                interne_seconden = 0;
+                interne_minuten++;
+                if (interne_minuten >= 60) {
+                    interne_minuten = 0;
+                    interne_uren++;
+                    if (interne_uren >= 24) {
+                        interne_uren = 0;
+                    }
+                }
+            }
         }
         
         // Bouw direct het nieuwe frame op op de achtergrond
@@ -1180,8 +1201,8 @@ void TIM2_IRQHandler1(void) {
 
 int main(void) {
     //SystemInitBareMetal_HSE_24MHz();
-  SystemInitBareMetal_HSI_24MHz();
-//    SystemInitBareMetal_HSI_48MHz();
+//  SystemInitBareMetal_HSI_24MHz();
+    SystemInitBareMetal_HSI_48MHz();
 
 
     SysTick->CTLR = 0x00000005;     
@@ -1220,13 +1241,13 @@ int main(void) {
 
     while(1) {
         if (nieuwe_tijd_beschikbaar) {
-            __disable_irq();
-            interne_frames = 0; // Reset frames strak op de seconde-puls van de GPS
+//            __disable_irq();
+//            interne_frames = 0; // Reset frames strak op de seconde-puls van de GPS
             ltc_stap_teller = 0;  // Reset de BPM sub-stap sync
-            __enable_irq();
+//            __enable_irq();
 
             start_systick_frame = SysTick->CNT;
-//            LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, interne_frames);
+            //LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, interne_frames);
 
             Klok_VerwerkGPS();
         }
@@ -1273,7 +1294,6 @@ int main(void) {
                 interne_frames = 0; // Wordt opgevangen door de hele-seconde loop, maar fungeert hier als vangnet
             }
 
-            // Genereer direct de nieuwe bitstroom voor de IRIS-B / SMET systemen
             LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, interne_frames);
         }
 */
