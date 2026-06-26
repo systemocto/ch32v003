@@ -11,6 +11,8 @@
 #define PCF9557_ADDRESS 0x18
 #define TMP102_ADDRESS 0x4A
 #define TIMEZONE_OFFSET   0  
+#define LTC_GPIO_PORT      GPIOD
+#define LTC_PIN            3      // Kies een vrije pin, bijv. PD3
 
 #define EEPROM_SIZE 256  // Veranderd van 128 naar 256 bytes
 volatile uint8_t i2c_eeprom[EEPROM_SIZE] = {0}; // De virtuele EEPROM in RAM
@@ -22,6 +24,10 @@ uint8_t  freerunning_modus = 1;
 uint8_t  freerunning_modus_old = 1;
 uint8_t  dubbelepunt_aan = 1;
 uint8_t  dipsw = 0;
+
+volatile uint8_t interne_frames = 0;
+uint32_t start_systick_frame = 0;
+const uint32_t EEN_FRAME_CYCLI = 24000000 / 25; // 960.000 hardware ticks per frame bij 24 MHz
 
 const uint32_t EEN_SECONDE_CYCLI = 24000000; 
 //const uint32_t EEN_SECONDE_CYCLI48mhz = 48000000; 
@@ -56,10 +62,19 @@ volatile uint8_t interne_dag = 1;   // Standaard opstartdatum 1 jan 2026
 volatile uint8_t interne_maand = 1;
 volatile uint8_t interne_jaar = 26;
 
-
 // Directe macro's om de TM1652 datalijn te besturen via het BSHR register
 #define SDA_HIGH()  (GPIOC->BSHR = (1 << TM1652_PIN))
 #define SDA_LOW()   (GPIOC->BSHR = (1 << (TM1652_PIN + 16)))
+
+volatile uint8_t ltc_frame_buffer[10] = {0}; // 80 bits = 10 bytes per frame
+volatile uint8_t ltc_bit_index = 0;
+volatile uint8_t ltc_sub_bit = 0;      // 0 = start van bit, 1 = midden (voor bit '1')
+volatile uint8_t ltc_huidige_bit = 0;
+volatile uint8_t ltc_output_state = 0;
+volatile uint8_t ltc_stap_teller = 0; // Loopt van 0 tot 159 (80 bits * 2 stappen)
+
+
+void LTC_BouwFrame(uint8_t u, uint8_t m, uint8_t s, uint8_t f);
 
 // ============================================================================
 // INITIALISATIE & SYSTEEM TIMING
@@ -844,6 +859,7 @@ void Klok_VerwerkGPS(void) {
         // Injecteer het proprietary kalibratiebericht
         UART1_ZendProprietaryData();
         UART1_ZendGNRMC();
+//        LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, 0);
     }
 }
 
@@ -911,7 +927,8 @@ void Klok_VerwerkInterneTijd(void) {
         TM1652_DisplayTijd(interne_uren, interne_minuten, 1);
         UART1_ZendProprietaryData();
         UART1_ZendGNRMC();
-
+        LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, 0);
+        
     }
 }
 
@@ -940,7 +957,222 @@ void UART1_SendUint32(uint32_t getal) {
     UART1_SendString(&buffer[i]);
 }
 
+// ============================================================================
+// SMPTE ST12M LTC
+// ============================================================================
 
+/*
+ * Initialiseer Timer 2 om interrupts te genereren op de LTC belfrequentie (4000 Hz)
+ * Dit is nodig om de helft van een '1'-bit te kunnen timen (250 microseconden).
+ */
+void LTC_Timer_Init1(void) {
+    // Schakel klok voor TIM2 in
+    RCC->APB1PCENR |= RCC_APB1Periph_TIM2;
+    
+    // Configureer LTC GPIO Pin als Output Push-Pull
+    LTC_GPIO_PORT->CFGLR &= ~(0xF << (LTC_PIN * 4));
+    LTC_GPIO_PORT->CFGLR |= (0x3 << (LTC_PIN * 4)); 
+
+    // TIM2 instellen voor 4000 Hz interrupt (250 us interval bij 24 MHz)
+    TIM2->PSC = 24 - 1;                // Prescaler: Klok naar 1 MHz
+    TIM2->ATRLR = 250 - 1;             // Auto-reload: 250 Ticks = 250 us
+    TIM2->INTFR = 0;                   // Wis vlaggen
+//    TIM2->DMAINTENR |= TIM_IT_Update;  // Update interrupt aanzetten
+    TIM2->DMAINTENR |= TIM_UIE;
+
+    NVIC_EnableIRQ(TIM2_IRQn);
+    TIM2->CTLR1 |= TIM_CEN;        // Start Timer 2
+}
+
+void LTC_Timer_Init(void) {
+    TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure = {0};
+
+    // 1. Klok inschakelen voor TIM2
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2, ENABLE);
+    
+    // 2. Configureer LTC GPIO Pin als Output Push-Pull (PD3)
+    GPIO_InitTypeDef GPIO_InitStructure = {0};
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOD, ENABLE);
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOD, &GPIO_InitStructure);
+
+    // 3. TIM2 instellen voor 4000 Hz interrupt (250 us bij 24 MHz)
+    TIM_TimeBaseStructure.TIM_Period = 250 - 1;
+    TIM_TimeBaseStructure.TIM_Prescaler = 24 - 1;
+    TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+    TIM_TimeBaseInit(TIM2, &TIM_TimeBaseStructure);
+
+    // 4. Wis vlaggen, zet de interrupt aan en start de timer
+    TIM_ClearFlag(TIM2, TIM_FLAG_Update);
+    TIM_ITConfig(TIM2, TIM_IT_Update, ENABLE);
+    
+    NVIC_EnableIRQ(TIM2_IRQn);
+    TIM_Cmd(TIM2, ENABLE); // Dit vervangt de TIM_CR1_CEN regel volledig!
+}
+
+void LTC_BouwFrame(uint8_t u, uint8_t m, uint8_t s, uint8_t f) {
+    uint8_t tmp[10] = {0};
+
+    // --- SPLIT TIJD & DATUM IN BCD NIBBLES ---
+    uint8_t f_een = f % 10;  uint8_t f_tien = f / 10;
+    uint8_t s_een = s % 10;  uint8_t s_tien = s / 10;
+    uint8_t m_een = m % 10;  uint8_t m_tien = m / 10;
+    uint8_t u_een = u % 10;  uint8_t u_tien = u / 10;
+
+    // Haal de globale datumvariabelen op uit je ch32v003 code
+    uint8_t d_een = interne_dag % 10;   uint8_t d_tien = interne_dag / 10;
+    uint8_t ma_een = interne_maand % 10; uint8_t ma_tien = interne_maand / 10;
+    uint8_t j_een = interne_jaar % 10;  uint8_t j_tien = interne_jaar / 10;
+
+    // --- SMPTE / EBU 80-BITS INTERLEAVED BIT MAPPING ---
+    
+    // Byte 0: Bits 0-3 (Frame eenheden) + Bits 4-7 (User Bits 1: Dag eenheden)
+    tmp[0] = (f_een & 0x0F) | ((d_een & 0x0F) << 4);
+
+    // Byte 1: Bits 8-11 (Frame tientallen) + Bits 12-15 (User Bits 2: Dag tientallen)
+    tmp[1] = (f_tien & 0x03) | ((d_tien & 0x0F) << 4); 
+    // Bit 10 & 11 zijn eventueel Dropframe/Colorframe flags, hier op 0 gehouden
+
+    // Byte 2: Bits 16-19 (Seconde eenheden) + Bits 20-23 (User Bits 3: Maand eenheden)
+    tmp[2] = (s_een & 0x0F) | ((ma_een & 0x0F) << 4);
+
+    // Byte 3: Bits 24-27 (Seconde tientallen) + Bits 28-31 (User Bits 4: Maand tientallen)
+    tmp[3] = (s_tien & 0x07) | ((ma_tien & 0x0F) << 4);
+
+    // Byte 4: Bits 32-35 (Minuut eenheden) + Bits 36-39 (User Bits 5: Jaar eenheden)
+    tmp[4] = (m_een & 0x0F) | ((j_een & 0x0F) << 4);
+
+    // Byte 5: Bits 40-43 (Minuut tientallen) + Bits 44-47 (User Bits 6: Jaar tientallen)
+    tmp[5] = (m_tien & 0x07) | ((j_tien & 0x0F) << 4);
+
+    // Byte 6: Bits 48-51 (Uur eenheden) + Bits 52-55 (User Bits 7: Vrij / Clock ID)
+    // We kunnen hier de dynamisch uitgelezen dipsw (0-15) inladen als identificatie!
+    tmp[6] = (u_een & 0x0F) | ((dipsw & 0x0F) << 4);
+
+    // Byte 7: Bits 56-59 (Uur tientallen) + Bits 60-63 (User Bits 8: Status / Vrij)
+    // Bit 58 is gereserveerd, Bit 59 is de Biphase Mark polarity correction bit
+    tmp[7] = (u_tien & 0x03) | (0x00 << 4); 
+
+    // Byte 8 & 9: Het dwingende lineaire Synchronisatiewoord (0xBFFC)
+    // Uitgeschreven in bits van links naar rechts: 00111111 11111101
+    tmp[8] = 0xFC; // Bits 64-71
+    tmp[9] = 0xBF; // Bits 72-79
+
+    // --- ATOMIC TRANSFERS NAAR HARDWARE BUFFER ---
+    // We zetten interrupts heel kort uit om te voorkomen dat TIM2 halverwege 
+    // een bit-transmissie een half geüpdatete frame-array uitleest.
+    __disable_irq();
+    for(uint8_t i = 0; i < 10; i++) {
+        ltc_frame_buffer[i] = tmp[i];
+    }
+    __enable_irq();
+}
+
+/*
+ * Timer 2 Hardware Interrupt - Genereert het BPM signaal op de GPIO-pin
+ */
+void TIM2_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void TIM2_IRQHandler(void) {
+    // 1. Wis de interrupt vlag direct
+    TIM2->INTFR = (uint16_t)~TIM_UIF; 
+
+    // 2. Bepaal de huidige bit-index (0 t/m 79) en de sub-stap (0 of 1)
+    uint8_t bit_index = ltc_stap_teller >> 1; // ltc_stap_teller / 2
+    uint8_t sub_stap  = ltc_stap_teller & 0x01; // ltc_stap_teller % 2
+
+    uint8_t byte_pos = bit_index >> 3;  // bit_index / 8
+    uint8_t bit_pos  = bit_index & 0x07; // bit_index % 8
+
+    // 3. Haal de bitwaarde op
+    uint8_t actieve_bit = (ltc_frame_buffer[byte_pos] >> bit_pos) & 0x01;
+
+    // 4. BPM Modulatie Beslissing Matrix
+    uint8_t moet_toggeleren = 0;
+
+    if (sub_stap == 0) {
+        // De start van ELKE bitperiode moet ALTIJD toggeleren
+        moet_toggeleren = 1;
+    } else {
+        // Halverwege de bitperiode: toggle ALLEEN als de bit een '1' is
+        if (actieve_bit == 1) {
+            moet_toggeleren = 1;
+        }
+    }
+
+    // 5. Voer de toggle fysiek uit op de GPIO-poort
+    if (moet_toggeleren) {
+        ltc_output_state ^= 1;
+        if (ltc_output_state) {
+            GPIOD->BSHR = (1 << LTC_PIN);
+        } else {
+            GPIOD->BSHR = (1 << (LTC_PIN + 16));
+        }
+    }
+
+    // 6. Schuif de teller op naar de volgende stap
+    ltc_stap_teller++;
+    if (ltc_stap_teller >= 160) {
+        ltc_stap_teller = 0; // Frame compleet, begin opnieuw bij bit 0
+
+        interne_frames++;
+        if (interne_frames >= 25) {
+            // We resetten de frames niet hardcoded hier, 
+            // dat mag de seconde-puls zo dadelijk doen!
+        }
+        
+        // Bouw direct het nieuwe frame op op de achtergrond
+        LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, interne_frames);
+
+    }
+}
+
+void TIM2_IRQHandler1(void) {
+    if (TIM2->INTFR & TIM_UIF) {
+        TIM2->INTFR = ~TIM_UIF; // Wis interrupt vlag
+
+        if (ltc_sub_bit == 0) {
+            // Haal de huidige bit op uit de frame buffer
+            uint8_t byte_pos = ltc_bit_index / 8;
+            uint8_t bit_pos = ltc_bit_index % 8;
+            ltc_huidige_bit = (ltc_frame_buffer[byte_pos] >> bit_pos) & 0x01;
+
+            // Elke bit start ALTIJD met een flankwisseling (BPM specificatie)
+            ltc_output_state ^= 1;
+            if (ltc_output_state) {
+                LTC_GPIO_PORT->BSHR = (1 << LTC_PIN);
+            } else {
+                LTC_GPIO_PORT->BSHR = (1 << (LTC_PIN + 16));
+            }
+
+            if (ltc_huidige_bit == 1) {
+                ltc_sub_bit = 1; // Bit is '1', we moeten halverwege nog een keer flippen
+            } else {
+                // Bit is '0', klaar met deze bit
+                ltc_bit_index++;
+            }
+        } else {
+            // Halverwege de '1' bit: wissel de flank nog een keer
+            ltc_output_state ^= 1;
+            if (ltc_output_state) {
+                LTC_GPIO_PORT->BSHR = (1 << LTC_PIN);
+            } else {
+                LTC_GPIO_PORT->BSHR = (1 << (LTC_PIN + 16));
+            }
+            
+            ltc_sub_bit = 0;
+            ltc_bit_index++;
+        }
+
+        // Frame klaar? Reset de bit index naar 0 voor het volgende frame
+        if (ltc_bit_index >= 80) {
+            ltc_bit_index = 0;
+            ltc_sub_bit = 0;
+        }
+    }
+}
 
 // ============================================================================
 // HOOFDPROGRAMMA & CORE TIME LOOPS
@@ -980,12 +1212,22 @@ int main(void) {
     UART1_SendUint32(BaudrateTabel[huidige_baudrate_index]);
     UART1_SendString(" baud!\r\n");
 
+    LTC_Timer_Init();
     start_systick_seconde = SysTick->CNT;
     laatste_gps_pakket_tijd = SysTick->CNT;
+    start_systick_frame = SysTick->CNT;
 
 
     while(1) {
         if (nieuwe_tijd_beschikbaar) {
+            __disable_irq();
+            interne_frames = 0; // Reset frames strak op de seconde-puls van de GPS
+            ltc_stap_teller = 0;  // Reset de BPM sub-stap sync
+            __enable_irq();
+
+            start_systick_frame = SysTick->CNT;
+//            LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, interne_frames);
+
             Klok_VerwerkGPS();
         }
 
@@ -1023,6 +1265,19 @@ int main(void) {
         if ((SysTick->CNT - start_systick_seconde) >= (uint32_t)(gemiddelde_seconde_fixed / 1000ULL)) {
             Klok_VerwerkInterneTijd();
         }
+/*
+        if ((SysTick->CNT - start_systick_frame) >= EEN_FRAME_CYCLI) {
+            start_systick_frame += EEN_FRAME_CYCLI; // Schuif de frame-tijd-as op
+            interne_frames++;
+            if (interne_frames >= 25) {
+                interne_frames = 0; // Wordt opgevangen door de hele-seconde loop, maar fungeert hier als vangnet
+            }
+
+            // Genereer direct de nieuwe bitstroom voor de IRIS-B / SMET systemen
+            LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, interne_frames);
+        }
+*/
+
         
     i2c_eeprom[0x10] = interne_uren;
     i2c_eeprom[0x11] = interne_minuten;
