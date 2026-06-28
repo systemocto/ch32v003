@@ -20,14 +20,14 @@
 #define IRIG_PIN           2      // Kies een vrije pin, bijv. PD2 voor IRIG-B output
 
 #define EEPROM_SIZE 256
-volatile uint8_t i2c_eeprom[EEPROM_SIZE] = {0}; // De virtuele EEPROM in RAM (zie RW/RO lijst)
+volatile uint8_t i2c_eeprom[EEPROM_SIZE] = {0}; // De virtuele EEPROM in RAM (zie RW/RO lijst, Flash_BlankCheck_Init)
 #define FLASH_EEPROM_PAGE_ADDR  0x00003FC0  // Laatste 64-byte pagina in de 16KB Flash
 #define FLASH_WRITE_INTERVAL    0        // Interval in seconds (e.g. 2^13 = 8192 seconds)
 volatile uint8_t flash_write_interval = FLASH_WRITE_INTERVAL;
 
 uint32_t flash_timer_seconden = 0;          // Telt de verstreken seconden
 volatile uint8_t trigger_flash_write = 0;   // Vlag voor de main-loop
-
+void Flash_Save_EEPROM_Page(void);
 
 // Hulpvariabelen voor de hoofdloop timing
 uint32_t start_systick_seconde;
@@ -92,7 +92,7 @@ volatile uint8_t ltc_sub_bit = 0;      // 0 = start van bit, 1 = midden (voor bi
 volatile uint8_t ltc_huidige_bit = 0;
 volatile uint8_t ltc_output_state = 0;
 volatile uint8_t ltc_stap_teller = 0; // Loopt van 0 tot 159 (80 bits * 2 stappen)
-volatile int8_t ltc_fr_offset = 0;
+volatile uint8_t ltc_fr_offset = 127; // bias 127
 void LTC_BouwFrame(uint8_t u, uint8_t m, uint8_t s, uint8_t f);
 
 #ifdef IRIGOUT
@@ -493,12 +493,46 @@ void I2C_EEPROM_VerwerkPolling(void) {
 }
 
 void I2C_EEPROM_VulTestpatroon(void) {
-//    for (uint16_t i = 0; i < EEPROM_SIZE; i++) i2c_eeprom[i] = (uint8_t)i; 
+    for (uint16_t i = 0; i < EEPROM_SIZE; i++) i2c_eeprom[i] = (uint8_t)i; 
 
+}
+
+void Flash_BlankCheck_Init(void) {
     uint8_t *flash_ptr = (uint8_t*)FLASH_EEPROM_PAGE_ADDR;
-    for(int i = 0; i < 32; i++) {
-        // Als de flash leeg is (0xFF), kun je ervoor kiezen om de RAM-array op 0 te laten staan
+    uint8_t is_blank = 1;
+
+    // 1. Controleer of de eerste 32 bytes van de Flash-pagina volledig leeg (0xFF) zijn
+    for (int i = 0; i < 32; i++) {
         if (flash_ptr[i] != 0xFF) {
+            is_blank = 0; // Er staat al data in de flash!
+            break;
+        }
+    }
+
+    // 2. Als de Flash leeg is, laad fabrieksinstellingen (defaults) in RAM en sla ze op
+    if (is_blank) {
+        // Wis eerst de gehele array naar 0
+        for (int i = 0; i < EEPROM_SIZE; i++) {
+            i2c_eeprom[i] = 0x00;
+        }
+
+        // Specifieke default waarden toewijzen volgens onze EEPROM map:
+        i2c_eeprom[0x00] = 0x00; // Systeem Status OK
+        i2c_eeprom[0x01] = 0x07; // Max helderheid display (TM1652)
+        i2c_eeprom[0x02] = 0x00; // Flash schrijf interval standaard UIT (0)
+        i2c_eeprom[0x04] = 0x02; // DST / Zomertijd op Automatisch
+        i2c_eeprom[0x05] = 0x00; // Display modus (Standaard Tijd)
+        i2c_eeprom[0x06] = 0x00; // LTC Frame Offset = 0 frames
+        i2c_eeprom[0x07] = 0x00; // IRIG-B ms Offset = 0 ms
+        i2c_eeprom[0x17] = 0x01; // Tijdzone UTC+1 (Nederlandse wintertijd)
+
+        // Sla deze fabrieksinstellingen direct permanent op in de Flash
+        // Zodat bij de volgende boot de pagina niet meer als 'blank' wordt gezien
+        Flash_Save_EEPROM_Page();
+    } 
+    // 3. Als de Flash al geconfigureerde data bevat, laad deze in de RAM-array
+    else {
+        for (int i = 0; i < 32; i++) {
             i2c_eeprom[i] = flash_ptr[i];
         }
     }
@@ -1666,7 +1700,8 @@ int main(void) {
     SysTick->CTLR = 0x00000005;     
     Peripherals_Init();
     Pure_Hardware_I2C_Slave_Init();
-    I2C_EEPROM_VulTestpatroon();
+//    I2C_EEPROM_VulTestpatroon();
+    Flash_BlankCheck_Init();
 
     i2c_eeprom[0x00] = BRIGHTNESS;
     i2c_eeprom[0x17] = (uint8_t)tijdzone_offset; // Cast naar uint8_t voor de array
@@ -1749,8 +1784,12 @@ int main(void) {
     
         tijdzone_offset = (int8_t) i2c_eeprom[0x17]; // Cast naar int8_t voor de array
         brightness = i2c_eeprom[0x00];
-        ltc_fr_offset = (int8_t)i2c_eeprom[0x06];
-        irig_ms_offset = (int32_t)((int8_t)i2c_eeprom[0x07]);
+        ltc_fr_offset = (int16_t)i2c_eeprom[0x06] - 127;
+        irig_ms_offset = (int32_t)i2c_eeprom[0x07] - 127;
+        // In de main loop (voorkom dat 255 voor rare sprongen zorgt):
+        if (i2c_eeprom[0x06] == 255) i2c_eeprom[0x06] = 127; // Reset naar 0 offset
+        if (i2c_eeprom[0x07] == 255) i2c_eeprom[0x07] = 127; // Reset naar 0 offset
+
 
         I2C_EEPROM_VerwerkPolling();
         if (trigger_flash_write) {
