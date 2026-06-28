@@ -19,8 +19,15 @@
 #define IRIG_GPIO_PORT     GPIOD
 #define IRIG_PIN           2      // Kies een vrije pin, bijv. PD2 voor IRIG-B output
 
-#define EEPROM_SIZE 256  // Veranderd van 128 naar 256 bytes
-volatile uint8_t i2c_eeprom[EEPROM_SIZE] = {0}; // De virtuele EEPROM in RAM
+#define EEPROM_SIZE 256
+volatile uint8_t i2c_eeprom[EEPROM_SIZE] = {0}; // De virtuele EEPROM in RAM (zie RW/RO lijst)
+#define FLASH_EEPROM_PAGE_ADDR  0x00003FC0  // Laatste 64-byte pagina in de 16KB Flash
+#define FLASH_WRITE_INTERVAL    0        // Interval in seconds (e.g. 2^13 = 8192 seconds)
+volatile uint8_t flash_write_interval = FLASH_WRITE_INTERVAL;
+
+uint32_t flash_timer_seconden = 0;          // Telt de verstreken seconden
+volatile uint8_t trigger_flash_write = 0;   // Vlag voor de main-loop
+
 
 // Hulpvariabelen voor de hoofdloop timing
 uint32_t start_systick_seconde;
@@ -85,12 +92,14 @@ volatile uint8_t ltc_sub_bit = 0;      // 0 = start van bit, 1 = midden (voor bi
 volatile uint8_t ltc_huidige_bit = 0;
 volatile uint8_t ltc_output_state = 0;
 volatile uint8_t ltc_stap_teller = 0; // Loopt van 0 tot 159 (80 bits * 2 stappen)
+volatile int8_t ltc_fr_offset = 0;
 void LTC_BouwFrame(uint8_t u, uint8_t m, uint8_t s, uint8_t f);
 
 #ifdef IRIGOUT
 volatile uint8_t irig_bits[100] = {0}; // Buffer voor 100 IRIG-bits per seconde
 volatile uint8_t irig_bit_index = 0;   // Huidige bit (0 t/m 99)
 volatile uint8_t irig_tick_counter = 0; // Telt interrupts binnen de 10ms bit (0 t/m 39)
+volatile int32_t irig_ms_offset = 0;
 void IRIG_BouwFrame(uint8_t u, uint8_t m, uint8_t s);
 #endif
 
@@ -163,7 +172,6 @@ void Delay_us(uint32_t us) {
     
     while((SysTick->CNT - start) < cycli);
 }
-
 
 void Peripherals_Init(void) {
     RCC->APB2PCENR |= RCC_AFIOEN | RCC_IOPCEN | RCC_IOPDEN | RCC_USART1EN; 
@@ -375,7 +383,7 @@ void Pure_Hardware_I2C_Slave_Init(void)
     I2C_Cmd(I2C1, ENABLE);
 }
 
-void I2C_EEPROM_VerwerkPolling(void) {
+void I2C_EEPROM_VerwerkPolling1(void) {
     uint32_t star1 = I2C1->STAR1;
 
     // 1. ADDR Vlag: De Pi heeft ons adres (0x30) aangeroepen
@@ -424,8 +432,77 @@ void I2C_EEPROM_VerwerkPolling(void) {
         I2C1->STAR1 &= ~(I2C_STAR1_BERR | I2C_STAR1_AF); // Wis de foutvlaggen om de bus te deblokkeren
     }
 }
+void I2C_EEPROM_VerwerkPolling(void) {
+    uint32_t star1 = I2C1->STAR1;
 
-void I2C_EEPROM_VulTestpatroon(void) { for (uint16_t i = 0; i < EEPROM_SIZE; i++) i2c_eeprom[i] = (uint8_t)i; }
+    // 1. ADDR Vlag: De Pi heeft ons adres (0x30) aangeroepen
+    if (star1 & I2C_STAR1_ADDR) {
+        i2c_first_byte = 1; 
+        
+        // WCH SPECIFIEKE EVENT: Lees STAR1 (reeds gedaan) en direct daarna STAR2.
+        // Dit wist de ADDR vlag en geeft de kloklijn (SCL) direct weer vrij!
+        volatile uint32_t star2 = I2C1->STAR2; 
+        (void)star2;
+        
+        // Leg direct alvast de ALLEREERSTE mogelijke byte klaar in de buffer 
+        // voor het geval dat de master direct een Read-actie start.
+        I2C1->DATAR = i2c_eeprom[i2c_reg_pointer];
+    }
+
+    // 2. RXNE Vlag: De Pi schrijft data naar ons (Pointer of registerwaarde)
+    if (star1 & I2C_STAR1_RXNE) {
+        uint8_t received_byte = I2C1->DATAR; // Het lezen wist de RXNE vlag automatisch
+        
+        if (i2c_first_byte) {
+            i2c_reg_pointer = received_byte % EEPROM_SIZE; // Set de veilige 256-bytes pointer
+            i2c_first_byte = 0;
+        } else {
+            // Alleen schrijven toestaan naar de expliciete RW registers uit de map: (RW/RO)
+            if (i2c_reg_pointer == 0x01 || i2c_reg_pointer == 0x02 || 
+                i2c_reg_pointer == 0x04 || i2c_reg_pointer == 0x05 || 
+                i2c_reg_pointer == 0x06 || i2c_reg_pointer == 0x17) {
+                
+                i2c_eeprom[i2c_reg_pointer] = received_byte; 
+            } else {
+                // Register is RO of gereserveerd: we negeren de data stilzwijgend.
+            }
+            
+            // De pointer moet ALTIJD ophogen, ook als het schrijven is geblokkeerd!
+            i2c_reg_pointer = (i2c_reg_pointer + 1) % EEPROM_SIZE; 
+        }
+    }
+
+    // 3. TXE Vlag: De Pi wil een byte uit ons register lezen (i2cdump)
+    if (star1 & I2C_STAR1_TXE) {
+        // Vul direct het dataregister. Doordat SCL gerekt mag worden, 
+        // wacht de Pi netjes tot deze regel is uitgevoerd!
+        I2C1->DATAR = i2c_eeprom[i2c_reg_pointer]; 
+        i2c_reg_pointer = (i2c_reg_pointer + 1) % EEPROM_SIZE; 
+    }
+
+    // 4. STOPF Vlag: De Pi sluit de transactie netjes af met een STOP
+    if (star1 & I2C_STAR1_STOPF) {
+        // Wist de STOPF vlag door CTLR1 naar zichzelf terug te schrijven
+        I2C1->CTLR1 = I2C1->CTLR1; 
+    }
+
+    // 5. AF / BERR Vlag: Herstel bij ACK-failure (gebeurt standaard aan het einde van elke i2cdump regel)
+    if (star1 & (I2C_STAR1_BERR | I2C_STAR1_AF)) {
+        I2C1->STAR1 &= ~(I2C_STAR1_BERR | I2C_STAR1_AF); // Wis de foutvlaggen om de bus te deblokkeren
+    }
+}
+
+void I2C_EEPROM_VulTestpatroon(void) {
+//    for (uint16_t i = 0; i < EEPROM_SIZE; i++) i2c_eeprom[i] = (uint8_t)i; 
+
+    uint8_t *flash_ptr = (uint8_t*)FLASH_EEPROM_PAGE_ADDR;
+    for(int i = 0; i < 32; i++) {
+        // Als de flash leeg is (0xFF), kun je ervoor kiezen om de RAM-array op 0 te laten staan
+        if (flash_ptr[i] != 0xFF) {
+            i2c_eeprom[i] = flash_ptr[i];
+        }
+    }
+}
 
 
 // Hulpfunctie om 1 byte naar een specifiek register van de PCF9557 te schrijven
@@ -1045,6 +1122,19 @@ void Klok_VerwerkInterneTijd(void) {
         LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, 0);
         
     }
+
+    if (flash_write_interval > 0) {
+        flash_timer_seconden++;
+        
+        if (flash_timer_seconden >= (1UL << flash_write_interval)) {
+            flash_timer_seconden = 0;
+            trigger_flash_write = 1; // Zet de vlag voor de main loop
+        }
+    } else {
+        flash_timer_seconden = 0;
+        trigger_flash_write = 0;    // Geforceerd uitgeschakeld als register 0x02 gelijk is aan 0
+    }
+
 }
 
 void UART1_SendString(char *str) {
@@ -1132,7 +1222,7 @@ void LTC_Timer_Init(void) {
     TIM_Cmd(TIM2, ENABLE); // Dit vervangt de TIM_CR1_CEN regel volledig!
 }
 
-void LTC_BouwFrame(uint8_t u, uint8_t m, uint8_t s, uint8_t f) {
+void LTC_BouwFrame1(uint8_t u, uint8_t m, uint8_t s, uint8_t f) {
     uint8_t tmp[10] = {0};
 
     // --- SPLIT TIJD & DATUM IN BCD NIBBLES ---
@@ -1190,8 +1280,74 @@ void LTC_BouwFrame(uint8_t u, uint8_t m, uint8_t s, uint8_t f) {
     __enable_irq();
 }
 
+void LTC_BouwFrame(uint8_t u, uint8_t m, uint8_t s, uint8_t f) {
+    uint8_t tmp[10] = {0};
+    
+    // 1. Haal de offset op uit EEPROM register 0x06 en behandel direct als signed 8-bit integer (-127..+127)
+//    int8_t offset = (int8_t)i2c_eeprom[0x06];
+//    ltc_fr_offset = (int8_t)i2c_eeprom[0x06];
+
+
+    // Stel hier je frame-rate in (bijv. 25 voor EBU, 30 voor SMPTE)
+    const uint8_t FPS = 25; 
+
+    // 2. Converteer de huidige invoertijd volledig naar frames (totaal aantal frames in de dag)
+    int32_t totaal_frames = ((int32_t)u * 3600 + (int32_t)m * 60 + (int32_t)s) * FPS + f;
+
+    // Pas de offset direct toe
+    totaal_frames += ltc_fr_offset;
+
+    // 3. Handhaaf rollover over de grens van een volledige dag (24 uur)
+    int32_t frames_per_dag = 24L * 3600L * FPS;
+    
+    if (totaal_frames < 0) {
+        totaal_frames += frames_per_dag;
+    } else if (totaal_frames >= frames_per_dag) {
+        totaal_frames -= frames_per_dag;
+    }
+
+    // 4. Herbereken de gecorrigeerde u, m, s, f parameters uit de frames
+    f = totaal_frames % FPS;
+    totaal_frames /= FPS;
+    s = totaal_frames % 60;
+    totaal_frames /= 60;
+    m = totaal_frames % 60;
+    u = totaal_frames / 60;
+
+    // --- VANAF HIER IS JOUW BESTAANDE SPLIT & MAPPING LOGICA ACTIEF ---
+    uint8_t f_een = f % 10;  uint8_t f_tien = f / 10;
+    uint8_t s_een = s % 10;  uint8_t s_tien = s / 10;
+    uint8_t m_een = m % 10;  uint8_t m_tien = m / 10;
+    uint8_t u_een = u % 10;  uint8_t u_tien = u / 10;
+
+    uint8_t d_een = interne_dag % 10;   uint8_t d_tien = interne_dag / 10;
+    uint8_t ma_een = interne_maand % 10; uint8_t ma_tien = interne_maand / 10;
+    uint8_t j_een = interne_jaar % 10;  uint8_t j_tien = interne_jaar / 10;
+
+    // SMPTE / EBU 80-BITS INTERLEAVED BIT MAPPING
+    tmp[0] = (f_een & 0x0F) | ((d_een & 0x0F) << 4);
+    tmp[1] = (f_tien & 0x03) | ((d_tien & 0x0F) << 4); 
+    tmp[2] = (s_een & 0x0F) | ((ma_een & 0x0F) << 4);
+    tmp[3] = (s_tien & 0x07) | ((ma_tien & 0x0F) << 4);
+    tmp[4] = (m_een & 0x0F) | ((j_een & 0x0F) << 4);
+    tmp[5] = (m_tien & 0x07) | ((j_tien & 0x0F) << 4);
+    tmp[6] = (u_een & 0x0F) | ((dipsw & 0x0F) << 4);
+    tmp[7] = (u_tien & 0x03) | (0x00 << 4); 
+
+    tmp[8] = 0xFC; 
+    tmp[9] = 0xBF; 
+
+    // ATOMIC TRANSFERS NAAR HARDWARE BUFFER
+    __disable_irq();
+    for(uint8_t i = 0; i < 10; i++) {
+        ltc_frame_buffer[i] = tmp[i];
+    }
+    __enable_irq();
+}
+
+
 /*
- * Timer 2 Hardware Interrupt - Genereert het BPM signaal op de GPIO-pin
+ * Timer 2 Hardware Interrupt - Genereert het LTC signaal op de GPIO-pin
  */
 void TIM2_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 void TIM2_IRQHandler(void) {
@@ -1252,7 +1408,6 @@ void TIM2_IRQHandler(void) {
                 }
             }
 #ifdef IRIGOUT
-            // --- VERVERS IRIG-B STREAM VOOR DE NIEUWE SECONDE ---
             IRIG_BouwFrame(interne_uren, interne_minuten, interne_seconden);
             irig_bit_index = 0; // Synchroniseer de IRIG bit-as strak met de LTC-as
             irig_tick_counter = 0;
@@ -1260,7 +1415,6 @@ void TIM2_IRQHandler(void) {
 
         }
         
-        // Bouw direct het nieuwe frame op op de achtergrond
         LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, interne_frames);
 
     }
@@ -1279,7 +1433,7 @@ void TIM2_IRQHandler(void) {
         irig_hoog_grens = 32;    // Sync Marker (P): 8 ms hoog = 32 ticks
     }
 
-    // PWM Schakelmomenten uitvoeren op PD2
+    // PWM Schakelmomenten uitvoeren op IRIG_PIN
     if (irig_tick_counter < irig_hoog_grens) {
         IRIG_GPIO_PORT->BSHR = (1 << IRIG_PIN);        // Pin HOOG
     } else {
@@ -1354,7 +1508,7 @@ void IRIG_Init(void) {
     IRIG_GPIO_PORT->CFGLR |= (0x3 << (IRIG_PIN * 4));  
 }
 
-void IRIG_BouwFrame(uint8_t u, uint8_t m, uint8_t s) {
+void IRIG_BouwFrame1(uint8_t u, uint8_t m, uint8_t s) {
     // 1. Wis de bitstream (alles op '0')
     for(uint8_t i = 0; i < 100; i++) irig_bits[i] = 0;
 
@@ -1391,8 +1545,112 @@ void IRIG_BouwFrame(uint8_t u, uint8_t m, uint8_t s) {
     if(u_een & 0x04) irig_bits[22] = 1; if(u_een & 0x08) irig_bits[23] = 1;
     if(u_tien & 0x01) irig_bits[25] = 1; if(u_tien & 0x02) irig_bits[26] = 1;
 }
+void IRIG_BouwFrame(uint8_t u, uint8_t m, uint8_t s) {
+    // Wis de bitstream (alles op '0')
+    for(uint8_t i = 0; i < 100; i++) irig_bits[i] = 0;
+
+    // Plaats de verplichte Position Identifiers (8ms pulsen)
+    irig_bits[0]  = 2; // P0 (Start van frame)
+    irig_bits[9]  = 2; // P1
+    irig_bits[19] = 2; // P2
+    irig_bits[29] = 2; // P3
+    irig_bits[39] = 2; // P4
+    irig_bits[49] = 2; // P5
+    irig_bits[59] = 2; // P6
+    irig_bits[69] = 2; // P7
+    irig_bits[79] = 2; // P8
+    irig_bits[89] = 2; // P9
+    irig_bits[99] = 2; // P5 (Laatste bit voor de omslag)
+
+    // Codeer Seconden (Bits 1-4 eenheden, Bits 6-8 tientallen)
+    uint8_t s_een = s % 10; uint8_t s_tien = s / 10;
+    if(s_een & 0x01) irig_bits[1] = 1; if(s_een & 0x02) irig_bits[2] = 1;
+    if(s_een & 0x04) irig_bits[3] = 1; if(s_een & 0x08) irig_bits[4] = 1;
+    if(s_tien & 0x01) irig_bits[5] = 1; if(s_tien & 0x02) irig_bits[6] = 1;
+    if(s_tien & 0x04) irig_bits[7] = 1;
+
+    // Codeer Minuten (Bits 10-13 eenheden, Bits 15-17 tientallen)
+    uint8_t m_een = m % 10; uint8_t m_tien = m / 10;
+    if(m_een & 0x01) irig_bits[10] = 1; if(m_een & 0x02) irig_bits[11] = 1;
+    if(m_een & 0x04) irig_bits[12] = 1; if(m_een & 0x08) irig_bits[13] = 1;
+    if(m_tien & 0x01) irig_bits[15] = 1; if(m_tien & 0x02) irig_bits[16] = 1;
+    if(m_tien & 0x04) irig_bits[17] = 1;
+
+    // Codeer Uren (Bits 20-23 eenheden, Bits 25-26 tientallen)
+    uint8_t u_een = u % 10; uint8_t u_tien = u / 10;
+    if(u_een & 0x01) irig_bits[20] = 1; if(u_een & 0x02) irig_bits[21] = 1;
+    if(u_een & 0x04) irig_bits[22] = 1; if(u_een & 0x08) irig_bits[23] = 1;
+    if(u_tien & 0x01) irig_bits[25] = 1; if(u_tien & 0x02) irig_bits[26] = 1;
+
+    // --- MS OFFSET SYNC LOGICA ---
+    // Haal de milliseconde offset op uit EEPROM register 0x07 (-127..+127 ms)
+    //int32_t irig_ms_offset = (int32_t)((int8_t)i2c_eeprom[0x07]);
+
+    // Converteer ms naar timer ticks (1 ms = 4 ticks van 250us)
+    int32_t tick_offset = irig_ms_offset * 4; 
+
+    // Bereken de nieuwe startpositie binnen de 4000 ticks van de seconde.
+    // We trekken de tick_offset af om de puls te vervroegen bij een positieve offset.
+    int32_t target_ticks = 0 - tick_offset;
+
+    // Zorg dat het getal altijd binnen het bereik van 0 tot 3999 ticks valt (rollover)
+    while (target_ticks < 0)      target_ticks += 4000;
+    while (target_ticks >= 4000) target_ticks -= 4000;
+
+    // Dwing de IRIG engine direct naar deze verschoven bit- en tick-positie
+    __disable_irq();
+    irig_bit_index = target_ticks / 40;   // Bepaal welke van de 100 bits nu actief moet zijn
+    irig_tick_counter = target_ticks % 40;// Bepaal de sub-tick (0..39) binnen die bit
+    __enable_irq();
+}
+
 #endif
 
+
+    // ========================================================================
+    // FLASH
+    // ========================================================================
+
+void Flash_Unlock(void) {
+    if (FLASH->CTLR & FLASH_CTLR_LOCK) {
+        FLASH->KEYR = 0x45670123; // Sleutel 1
+        FLASH->KEYR = 0xCDEF89AB; // Sleutel 2
+    }
+}
+
+void Flash_Lock(void) {
+    FLASH->CTLR |= FLASH_CTLR_LOCK;
+}
+
+void Flash_Save_EEPROM_Page(void) {
+    // 1. Ontgrendel de Flash controller
+    Flash_Unlock();
+
+    // 2. Wis de specifieke 64-byte pagina (Page Erase)
+    FLASH->CTLR |= FLASH_CTLR_PER;                 // Selecteer Page Erase modus
+    FLASH->ADDR = FLASH_EEPROM_PAGE_ADDR;          // Geef het doeladres op
+    FLASH->CTLR |= FLASH_CTLR_STRT;                // Start de wis-operatie
+    while (FLASH->STATR & FLASH_STATR_BSY);        // Wacht tot de controller klaar is
+    FLASH->CTLR &= ~FLASH_CTLR_PER;                // Schakel Page Erase modus weer uit
+
+    // 3. Schrijf 32 bytes (als 16 opeenvolgende half-words / 16-bit getallen)
+    FLASH->CTLR |= FLASH_CTLR_PG;                  // Selecteer Program (Schrijf) modus
+    
+    uint32_t target_addr = FLASH_EEPROM_PAGE_ADDR;
+    for (int i = 0; i < 32; i += 2) {
+        // Combineer twee 8-bit bytes uit de RAM-array naar één 16-bit half-word (Little Endian)
+        uint16_t half_word = i2c_eeprom[i] | (i2c_eeprom[i + 1] << 8);
+        
+        *(volatile uint16_t*)target_addr = half_word; // Schrijf naar het Flash-adres
+        while (FLASH->STATR & FLASH_STATR_BSY);      // Wacht tot het schrijven klaar is
+        target_addr += 2;                             // Schuif 2 bytes op
+    }
+
+    FLASH->CTLR &= ~FLASH_CTLR_PG;                 // Schakel Program modus weer uit
+
+    // 4. Vergrendel de Flash controller weer ter beveiliging
+    Flash_Lock();
+}
 
 
 // ============================================================================
@@ -1400,15 +1658,16 @@ void IRIG_BouwFrame(uint8_t u, uint8_t m, uint8_t s) {
 // ============================================================================
 
 int main(void) {
-//    SystemInitBareMetal_HSE_24MHz();
-  SystemInitBareMetal_HSI_24MHz();
+    SystemInitBareMetal_HSE_24MHz();
+//  SystemInitBareMetal_HSI_24MHz();
 //    SystemInitBareMetal_HSI_48MHz();
 
 
     SysTick->CTLR = 0x00000005;     
     Peripherals_Init();
     Pure_Hardware_I2C_Slave_Init();
-//    I2C_EEPROM_VulTestpatroon();
+    I2C_EEPROM_VulTestpatroon();
+
     i2c_eeprom[0x00] = BRIGHTNESS;
     i2c_eeprom[0x17] = (uint8_t)tijdzone_offset; // Cast naar uint8_t voor de array
 
@@ -1479,20 +1738,32 @@ int main(void) {
         }
 
         
-    i2c_eeprom[0x10] = interne_uren;
-    i2c_eeprom[0x11] = interne_minuten;
-    i2c_eeprom[0x12] = interne_seconden;
-    i2c_eeprom[0x14] = interne_dag;
-    i2c_eeprom[0x15] = interne_maand;
-    i2c_eeprom[0x16] = interne_jaar;
+        i2c_eeprom[0x10] = interne_uren;
+        i2c_eeprom[0x11] = interne_minuten;
+        i2c_eeprom[0x12] = interne_seconden;
+        i2c_eeprom[0x14] = interne_dag;
+        i2c_eeprom[0x15] = interne_maand;
+        i2c_eeprom[0x16] = interne_jaar;
 
 
     
- 
-    tijdzone_offset = (int8_t) i2c_eeprom[0x17];
-    brightness = i2c_eeprom[0x00]; 
-    I2C_EEPROM_VerwerkPolling();
+        tijdzone_offset = (int8_t) i2c_eeprom[0x17]; // Cast naar int8_t voor de array
+        brightness = i2c_eeprom[0x00];
+        ltc_fr_offset = (int8_t)i2c_eeprom[0x06];
+        irig_ms_offset = (int32_t)((int8_t)i2c_eeprom[0x07]);
 
+        I2C_EEPROM_VerwerkPolling();
+        if (trigger_flash_write) {
+            trigger_flash_write = 0; // Reset de vlag direct
+            Flash_Save_EEPROM_Page(); // Sla de eerste 32 bytes veilig op
+        }
+
+        uint8_t i2c_waarde = i2c_eeprom[0x02];
+        if (i2c_waarde > 16) {
+            flash_write_interval = 16;
+        } else {
+            flash_write_interval = i2c_waarde;
+        }
 
         __asm("nop"); 
     }
