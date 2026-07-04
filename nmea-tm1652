@@ -195,9 +195,9 @@ void Peripherals_Init(void) {
     GPIOD->CFGLR &= ~(0xF << 20); GPIOD->CFGLR |= (0x3 << 20);   
     GPIOD->BSHR = (1 << 5); // Ruststand van UART TX is HOOG
 
-    // UPDATE: PD4 als NORMALE Output Push-Pull (0x3) voor de PPS-LED (Geïnverteerd)
+    // UPDATE: PD4 als NORMALE Output Push-Pull (0x3) voor de PPS-LED (Ge?nverteerd)
     GPIOD->CFGLR &= ~(0xF << 16); GPIOD->CFGLR |= (0x3 << 16);   
-    GPIOD->BSHR = (1 << 4); // Geïnverteerd opstarten (LED staat UIT)
+    GPIOD->BSHR = (1 << 4); // Ge?nverteerd opstarten (LED staat UIT)
 
     // Activeer vanaf nu alleen de ONTVANGER (RE) en de interrupt. De zender (TE) slopen we eruit!
     USART1->CTLR1 = 0;USART1->CTLR2 = 0;USART1->CTLR3 = 0;
@@ -286,7 +286,7 @@ void UART1_DetecteerBaudrate1(void) {
                 huidige_baudrate_index = standaard_index;
                 UART1_ScanInit(BaudrateTabel[huidige_baudrate_index]); 
                 
-                baudrate_gevonden = 1; // Beëindig de detectielus
+                baudrate_gevonden = 1; // Be?indig de detectielus
                 break; 
             }
         }
@@ -361,7 +361,7 @@ int8_t UART1_DetecteerBaudrate(void) {
             if (max_test_ronden > 0 && test_ronden_teller >= max_test_ronden) {
                 uint8_t standaard_index = i2c_eeprom[0x03];
                 
-                baudrate_gevonden = 1; // Beëindig de zoektocht
+                baudrate_gevonden = 1; // Be?indig de zoektocht
 
                 if (standaard_index >= AANTAL_BAUDRATES) {
                     huidige_baudrate_index = 0; 
@@ -390,7 +390,7 @@ const uint8_t CijferTabel[] = {
 
 uint8_t  brightness = BRIGHTNESS;
 const uint8_t BrightTabel[] = {
-    0x00, 0x04, 0x02, 0x06, 0x01, 0x05, 0x03, 0x07
+    0x04, 0x06, 0x00, 0x07, 0x02, 0x01, 0x03, 0x05
 };
 
 /* 
@@ -539,7 +539,7 @@ void TM1652_VerwerkAansturing(void) {
         // Update de globale helderheid variabele die je TM1652_DisplayTijd() gebruikt
         brightness = actuele_helderheid; 
 
-        // Stuur hard de initialisatie-pakketjes naar de TM1652 chip over de lijn
+    // Stuur hard de initialisatie-pakketjes naar de TM1652 chip over de lijn
         TM1652_SendByte(0x18); 
         TM1652_SendByte(0x18 + ((BrightTabel[brightness] & 0x07) << 1));
     }
@@ -554,14 +554,14 @@ void TM1652_VerwerkAansturing(void) {
             uint8_t bcd_min = BCD_TO_DEC(i2c_eeprom[0x11]);
             uint8_t dp = (interne_seconden % 2 == 0); // Knipperende dubbele punt
             
-            TM1652_DisplayTijd(bcd_uur, bcd_min, dp, 0);
-        } 
+            TM1652_DisplayTijd(bcd_uur, bcd_min, dp, !freerunning_modus);
+/       } 
         else if (actuele_modus == 0x01) {
             // Modus 1: Toon de live BCD Datum (Dag en Maand)
             uint8_t bcd_dag = BCD_TO_DEC(i2c_eeprom[0x14]);
             uint8_t bcd_mnd = BCD_TO_DEC(i2c_eeprom[0x15]);
             
-            TM1652_DisplayTijd(bcd_dag, bcd_mnd, 1, 1); 
+            TM1652_DisplayTijd(bcd_dag, bcd_mnd, 1, !freerunning_modus); 
         }
         else if (actuele_modus == 0x02) {
             // Modus 2: NMEA Status / Satellietmodus (Toon de actuele baudrate index)
@@ -1342,7 +1342,7 @@ void Klok_VerwerkGPS(void) {
         start_systick_seconde = nu_systick; 
 
         // Start de PPS-flits synchroon met de GPS
-        GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (Geïnverteerde LED gaat nu AAN)
+        GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (Ge?nverteerde LED gaat nu AAN)
         //PCF9557_WriteRegister(0x01, 0x00);
         pps_led_start_tijd = SysTick->CNT;
         pps_led_actief = 1;
@@ -1366,7 +1366,7 @@ void Klok_VerwerkInterneTijd(void) {
     start_systick_seconde += (uint32_t)(gemiddelde_seconde_fixed >> FILTER_SHIFT);
 
     // Start de PPS-flits synchroon met de vrije klok
-    GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (Geïnverteerde LED gaat nu AAN)
+    GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (Ge?nverteerde LED gaat nu AAN)
     pps_led_start_tijd = SysTick->CNT;
     pps_led_actief = 1;
 
@@ -1871,7 +1871,7 @@ int main(void) {
 
 
         if (pps_led_actief && (SysTick->CNT - pps_led_start_tijd) >= 1200000) {
-            GPIOD->BSHR = (1 << 4); // PD4 HOOG (Geïnverteerde LED gaat nu UIT)
+            GPIOD->BSHR = (1 << 4); // PD4 HOOG (Ge?nverteerde LED gaat nu UIT)
             //PCF9557_WriteRegister(0x01, 0x01);
             pps_led_actief = 0;
 
