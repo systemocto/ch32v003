@@ -4,25 +4,6 @@
 // CONFIGURATIE & CONFIGURATIE-PARAMETERS
 // ============================================================================
 
-// // Structuur om de registers van een specifieke CPX pin te beheren
-// typedef struct {
-//     GPIO_TypeDef* port;  // GPIOA, GPIOC of GPIOD
-//     uint8_t pin_nr;      // Het pinnummer (0-7)
-//     uint8_t shift;       // Positie in het CFGLR register (pin_nr * 4)
-// } CPX_Pin_t;
-
-// // Koppeling van jouw hardware-layout naar de MCU pinnen
-// const CPX_Pin_t CPX_Tabel[7] = {
-//     { GPIOA, 1,  4 }, // CPX1 = PA1
-//     { GPIOA, 2,  8 }, // CPX2 = PA2
-//     { GPIOD, 7, 28 }, // CPX3 = PD7
-//     { GPIOD, 0,  0 }, // CPX4 = PD0
-//     { GPIOC, 5, 20 }, // CPX5 = PC5
-//     { GPIOC, 6, 24 }, // CPX6 = PC6
-//     { GPIOC, 7, 28 }  // CPX7 = PC7
-// };
-
-
 #define GPS_RX_PIN  6  // PD6 (Vaste hardware USART1 RX pin voor de GPS module)
                        // PD5 = 1152008N1 out
                        // PD4 = PPS led
@@ -42,8 +23,8 @@
 
 #define VIRTUELE_SIZE_AT24C32 4096   // Wat de Pi verwacht te kunnen adresseren
 #define CONFIG_REGISTERS_SIZE   128   // Echte RAM-bytes voor je instellingen (0x00 - 0x1F)
-#define NMEA_BUFFER_SIZE      1200   // De grote transitbuffer voor je GPS-data
-#define BUFFER_SIZE_HALF     600
+#define NMEA_BUFFER_SIZE      1400   // De grote transitbuffer voor je GPS-data
+#define BUFFER_SIZE_HALF     700
 
 // Virtuele startlocatie op de AT24C32 waar de Pi de NMEA-stream kan vinden
 // 0x0100 (256) is handig, dan vallen alle config-registers netjes in de eerste pagina
@@ -132,23 +113,6 @@ volatile int32_t actuele_ppm = 0;
 // Snelle bitwise macro's voor BCD-conversie (zonder zware delingen)
 #define DEC_TO_BCD(val) ( (uint8_t) (((val / 10) << 4) | (val % 10)) )
 #define BCD_TO_DEC(val) ( (uint8_t) (((val >> 4) * 10) + (val & 0x0F)) )
-
-volatile uint8_t ltc_frame_buffer[10] = {0}; // 80 bits = 10 bytes per frame
-volatile uint8_t ltc_bit_index = 0;
-volatile uint8_t ltc_sub_bit = 0;      // 0 = start van bit, 1 = midden (voor bit '1')
-volatile uint8_t ltc_huidige_bit = 0;
-volatile uint8_t ltc_output_state = 0;
-volatile uint8_t ltc_stap_teller = 0; // Loopt van 0 tot 159 (80 bits * 2 stappen)
-volatile int16_t ltc_fr_offset = 127; // bias 127
-void LTC_BouwFrame(uint8_t u, uint8_t m, uint8_t s, uint8_t f);
-
-//#ifdef IRIGOUT
-volatile uint8_t irig_bits[100] = {0}; // Buffer voor 100 IRIG-bits per seconde
-volatile uint8_t irig_bit_index = 0;   // Huidige bit (0 t/m 99)
-volatile uint8_t irig_tick_counter = 0; // Telt interrupts binnen de 10ms bit (0 t/m 39)
-volatile int32_t irig_ms_offset = 0;
-//void IRIG_BouwFrame(uint8_t u, uint8_t m, uint8_t s);
-//#endif
 
 const uint8_t cmd_set_rmc_1hz[] = {0xF1, 0xD9, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x05, 0x01, 0x00, 0x1A, 0x0D, 0x0A};
 const uint8_t cmd_set_gsv_1hz[] = {0xF1, 0xD9, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x04, 0x02, 0x00, 0x19, 0x0D, 0x0A};
@@ -272,12 +236,6 @@ void Peripherals_Init(void) {
     NVIC_EnableIRQ(USART1_IRQn);
     SysTick->CTLR = 0x00000005;
 
-    // SysTick op 1000Hz zetten (1 ms periode) bij 24MHz HSI
-//    SysTick->CTLR = 0;
-//    SysTick->CNT = 0;
-//    SysTick->CMP = 24000 - 1;
-//    SysTick->CTLR = 0x0F;
-
     // Schakel de hardware-interrupts in voor de I2C periferie
 //    I2C1->CTLR2 |= I2C_CTLR2_ITEVTEN | I2C_CTLR2_ITBUFEN; // Activeer Event en Buffer interrupts
 
@@ -328,78 +286,6 @@ void UART1_ScanInit(uint32_t baudrate) {
     USART1->CTLR1 |= USART_CTLR1_UE | USART_CTLR1_RE; 
 }
 
-/*
-void UART1_DetecteerBaudrate1(void) {
-    uint32_t start_tijd;
-    uint8_t test_ronden_teller = 0; 
-    
-    // Laad het aantal gewenste testronden uit register 0x04
-    uint8_t max_test_ronden = i2c_config_regs[0x04];
-
-    // Zorg dat de RX pin (PD6) als input floating staat
-    RCC->APB2PCENR |= RCC_IOPDEN | RCC_USART1EN;
-    GPIOD->CFGLR &= ~(0xF << 24);
-    GPIOD->CFGLR |=  (0x4 << 24);
-
-    // --- DIRECTE FALLBACK CHECK (0xFF) ---
-    // Als de waarde 0xFF is, slaan we de hele autodetectie over en laden we direct de default
-    if (max_test_ronden == 0xFF) {
-        uint8_t standaard_index = i2c_config_regs[0x03];
-        if (standaard_index >= AANTAL_BAUDRATES) {
-            standaard_index = 0; 
-        }
-        huidige_baudrate_index = standaard_index;
-        UART1_ScanInit(BaudrateTabel[huidige_baudrate_index]);
-        baudrate_gevonden = 1;
-        return; // Verlaat de functie direct
-    }
-
-    while (!baudrate_gevonden) {
-        uint32_t test_baudrate = BaudrateTabel[huidige_baudrate_index];
-        UART1_ScanInit(test_baudrate);
-        
-        // Wacht maximaal 1,5 seconde op deze baudrate om een '$' te spotten
-        start_tijd = SysTick->CNT;
-        const uint32_t ANDERHALVE_SECONDE = (EEN_SECONDE_CYCLI + (EEN_SECONDE_CYCLI/2));
-        
-        while ((SysTick->CNT - start_tijd) < ANDERHALVE_SECONDE) {
-            if (USART1->STATR & USART_STATR_RXNE) {
-                char c = (char)(USART1->DATAR);
-                if (c == '$') {
-                    baudrate_gevonden = 1;
-                    break; 
-                }
-            }
-        }
-        
-        if (!baudrate_gevonden) {
-            huidige_baudrate_index++;
-            
-            // Als we aan het einde van de tabel zijn, is er 1 volledige testronde voorbij
-            if (huidige_baudrate_index >= AANTAL_BAUDRATES) {
-                huidige_baudrate_index = 0; 
-                test_ronden_teller++; // Ophoog na volledige scan van alle baudrates
-            }
-
-            // --- TIMEOUT CHECK (Alleen als max_test_ronden GROTER is dan 0) ---
-            // Als max_test_ronden == 0, wordt deze if-statement overgeslagen en blijft hij oneindig testen
-            if (max_test_ronden > 0 && test_ronden_teller >= max_test_ronden) {
-                // Laad de fallback index uit register 0x03 en begrens deze veilig
-                uint8_t standaard_index = i2c_config_regs[0x03];
-                if (standaard_index >= AANTAL_BAUDRATES) {
-                    standaard_index = 0; 
-                }
-                
-                huidige_baudrate_index = standaard_index;
-                UART1_ScanInit(BaudrateTabel[huidige_baudrate_index]); 
-                
-                baudrate_gevonden = 1; // Be?indig de detectielus
-                break; 
-            }
-        }
-    }
-}
-*/
 
 /* res: 
  *  index 0..AANTAL_BAUDRATES-1 -> Succesvol autodetect via '$'
@@ -644,103 +530,6 @@ void I2C1_EV_IRQHandler(void) {
 }
 
 
-void I2C_EEPROM_VerwerkPolling0(void) {
-    uint32_t star1 = I2C1->STAR1;
-
-    // 1. ADDR: Adres match
-    if (star1 & I2C_STAR1_ADDR) {
-        i2c_address_state = 0;
-        volatile uint32_t star2 = I2C1->STAR2; // Correcte WCH-wis-methode binnen de if
-        (void)star2;
-
-        if (i2c_reg_pointer == 0x00F0) {
-            I2C1->DATAR = bulk_buffer_index;
-        } else if (i2c_reg_pointer < CONFIG_REGISTERS_SIZE) {
-            I2C1->DATAR = i2c_config_regs[i2c_reg_pointer];
-        } else {
-            I2C1->DATAR = 0x00;
-        }
-    }
-
-    // 2. RXNE: Data ontvangen van de PCIe kaart
-    if (star1 & I2C_STAR1_RXNE) {
-        uint8_t received_byte = I2C1->DATAR;
-
-        if (i2c_address_state == 0) {
-            i2c_reg_pointer = ((uint16_t)(received_byte & 0x0F) << 8);
-            i2c_address_state = 1;
-        } 
-        else if (i2c_address_state == 1) {
-            i2c_reg_pointer |= received_byte;
-            i2c_reg_pointer %= VIRTUELE_SIZE_AT24C32;
-            i2c_address_state = 2;
-        } 
-        else {
-            if (i2c_reg_pointer == 0x00F3) {
-                uint8_t handshaked_buf = received_byte;
-                if (handshaked_buf == buffer_klaar_voor_linux && handshaked_buf != 0xFF) {
-                    nmea_write_ptr[handshaked_buf] = 0;
-                    nmea_read_ptr[handshaked_buf] = 0;
-                    buffer_klaar_voor_linux = 0xFF;
-                    bulk_buffer_index = 0xFF;
-                    bulk_buffer_lengte = 0;
-                }
-            }
-            else if (i2c_reg_pointer < CONFIG_REGISTERS_SIZE) {
-                if (i2c_reg_pointer == 0x01 || i2c_reg_pointer == 0x02 || i2c_reg_pointer == 0x03 ||
-                    i2c_reg_pointer == 0x04 || i2c_reg_pointer == 0x05 || i2c_reg_pointer == 0x06 ||
-                    i2c_reg_pointer == 0x10 || i2c_reg_pointer == 0x11 || i2c_reg_pointer == 0x12 ||
-                    i2c_reg_pointer == 0x14 || i2c_reg_pointer == 0x15 || i2c_reg_pointer == 0x16 ||
-                    i2c_reg_pointer == 0x17) {
-                    i2c_config_regs[i2c_reg_pointer] = received_byte;
-                }
-            }
-            i2c_reg_pointer = (i2c_reg_pointer + 1) % VIRTUELE_SIZE_AT24C32;
-        }
-    }
-
-    // 3. TXE: Data versturen naar de PCIe kaart
-    if (star1 & I2C_STAR1_TXE) {
-        if (i2c_reg_pointer == 0x00F0) {
-            I2C1->DATAR = bulk_buffer_index;
-        }
-        else if (i2c_reg_pointer == 0x00F1) {
-            I2C1->DATAR = (uint8_t)((bulk_buffer_lengte >> 8) & 0xFF);
-        }
-        else if (i2c_reg_pointer == 0x00F2) {
-            I2C1->DATAR = (uint8_t)(bulk_buffer_lengte & 0xFF);
-        }
-        else if (i2c_reg_pointer < CONFIG_REGISTERS_SIZE) {
-            I2C1->DATAR = i2c_config_regs[i2c_reg_pointer];
-        } 
-        else if (i2c_reg_pointer >= NMEA_VIRTUEEL_START && i2c_reg_pointer < (NMEA_VIRTUEEL_START + NMEA_BUFFER_SIZE)) {
-            if (buffer_klaar_voor_linux != 0xFF) {
-                uint16_t lees_index = (buffer_klaar_voor_linux * BUFFER_SIZE_HALF) + nmea_read_ptr[buffer_klaar_voor_linux];
-                I2C1->DATAR = nmea_transit_buffer[lees_index];
-                nmea_read_ptr[buffer_klaar_voor_linux]++;
-            } else {
-                I2C1->DATAR = 0x00;
-            }
-        } 
-        else {
-            I2C1->DATAR = 0x00;
-        }
-        i2c_reg_pointer = (i2c_reg_pointer + 1) % VIRTUELE_SIZE_AT24C32;
-    }
-
-    // 4. STOPF: Transactie beëindigd
-    if (star1 & I2C_STAR1_STOPF) {
-        I2C1->CTLR1 = I2C1->CTLR1;
-    }
-
-    // HARDWARE FAILSAFE VOOR BIT-BANG GLITCHES: 
-    // Als de bus om wat voor reden dan ook vastloopt of een error vlag toont, 
-    // resetten we de I2C-foutvlaggen direct om de bus onmiddellijk weer open te gooien!
-    if (star1 & (I2C_STAR1_BERR | I2C_STAR1_AF | I2C_STAR1_ARLO)) {
-        I2C1->STAR1 &= ~(I2C_STAR1_BERR | I2C_STAR1_AF | I2C_STAR1_ARLO);
-    }
-}
-
 void I2C_EEPROM_VerwerkPolling(void) {
     uint32_t star1 = I2C1->STAR1;
     // 1. ADDR Vlag: De Pi start een transactie
@@ -853,195 +642,10 @@ void I2C_EEPROM_VerwerkPolling(void) {
     }
 }
 
-/*
-void I2C_EEPROM_VerwerkPolling16(void) {
-    uint32_t star1 = I2C1->STAR1;
-
-    // 1. ADDR Vlag: De Pi start een transactie
-    if (star1 & I2C_STAR1_ADDR) {
-        i2c_address_state = 0; // Verwacht High Byte van het adres
-        
-        volatile uint32_t star2 = I2C1->STAR2; // Wis ADDR vlag
-        (void)star2;
-        
-        // Data klaarzetten voor directe lees-actie (Current Address Read)
-        if (i2c_reg_pointer < CONFIG_REGISTERS_SIZE) {
-            I2C1->DATAR = i2c_config_regs[i2c_reg_pointer];
-        } 
-        else if (i2c_reg_pointer >= NMEA_VIRTUEEL_START && i2c_reg_pointer < (NMEA_VIRTUEEL_START + NMEA_BUFFER_SIZE)) {
-            I2C1->DATAR = nmea_transit_buffer[i2c_reg_pointer - NMEA_VIRTUEEL_START];
-        } 
-        else {
-            I2C1->DATAR = 0x00;
-        }
-    }
-
-    // 2. RXNE Vlag: De Pi stuurt data (Adres bytes of Schrijf-data)
-    if (star1 & I2C_STAR1_RXNE) {
-        uint8_t received_byte = I2C1->DATAR;
-        
-        if (i2c_address_state == 0) {
-            i2c_reg_pointer = ((uint16_t)(received_byte & 0x0F) << 8);
-            i2c_address_state = 1;
-        } 
-        else if (i2c_address_state == 1) {
-            i2c_reg_pointer |= received_byte;
-            i2c_reg_pointer %= VIRTUELE_SIZE_AT24C32;
-            i2c_address_state = 2;
-        } 
-        else {
-            // DATA SCHRIJVEN: De Pi schrijft naar de MCU
-            // Alleen toestaan in de configuratiereffers (NMEA-buffer is alleen lezen voor de Pi!)
-            if (i2c_reg_pointer < CONFIG_REGISTERS_SIZE) {
-                // Jouw specifieke schrijf-beveiliging filter:
-                if (i2c_reg_pointer == 0x01 || i2c_reg_pointer == 0x02 || i2c_reg_pointer == 0x03 ||
-                    i2c_reg_pointer == 0x04 || i2c_reg_pointer == 0x05 || i2c_reg_pointer == 0x06 ||
-                    i2c_reg_pointer == 0x10 || i2c_reg_pointer == 0x11 || i2c_reg_pointer == 0x12 ||
-                    i2c_reg_pointer == 0x14 || i2c_reg_pointer == 0x15 || i2c_reg_pointer == 0x16 ||
-                    i2c_reg_pointer == 0x17) {
-                    
-                    i2c_config_regs[i2c_reg_pointer] = received_byte;
-                }
-
-                if (i2c_reg_pointer == 0x1A) {
-                    // Als de Pi iets schrijft naar register 0x1A, resetten we de GPS buffer-pointer
-                    nmea_write_ptr = 0;
-                    i2c_config_regs[0x18] = 0;
-                    i2c_config_regs[0x19] = 0;
-                }
-            }
-            i2c_reg_pointer = (i2c_reg_pointer + 1) % VIRTUELE_SIZE_AT24C32;
-        }
-    }
-
-    // 3. TXE Vlag: De Pi leest opeenvolgende bytes (Sequential Read)
-    // Dit is waar de magie gebeurt als de Pi in één keer de 1200 bytes NMEA leest!
-    if (star1 & I2C_STAR1_TXE) {
-        if (i2c_reg_pointer < CONFIG_REGISTERS_SIZE) {
-            I2C1->DATAR = i2c_config_regs[i2c_reg_pointer];
-        } 
-        else if (i2c_reg_pointer >= NMEA_VIRTUEEL_START && i2c_reg_pointer < (NMEA_VIRTUEEL_START + NMEA_BUFFER_SIZE)) {
-            // Geef de byte uit de grote GPS NMEA-buffer door
-            I2C1->DATAR = nmea_transit_buffer[i2c_reg_pointer - NMEA_VIRTUEEL_START];
-        } 
-        else {
-            I2C1->DATAR = 0x00; // Buiten bereik
-        }
-        
-        i2c_reg_pointer = (i2c_reg_pointer + 1) % VIRTUELE_SIZE_AT24C32;
-    }
-
-    // 4 & 5. Stop en Foutafhandeling
-    if (star1 & I2C_STAR1_STOPF) {
-        I2C1->CTLR1 = I2C1->CTLR1;
-    }
-    if (star1 & (I2C_STAR1_BERR | I2C_STAR1_AF)) {
-        I2C1->STAR1 &= ~(I2C_STAR1_BERR | I2C_STAR1_AF);
-    }
-}
-
-void I2C_EEPROM_VerwerkPolling8(void) {
-    uint32_t star1 = I2C1->STAR1;
-
-    // 1. ADDR Vlag: De Pi heeft ons adres (0x30) aangeroepen
-    if (star1 & I2C_STAR1_ADDR) {
-        i2c_first_byte = 1; 
-        
-        // WCH SPECIFIEKE EVENT: Lees STAR1 (reeds gedaan) en direct daarna STAR2.
-        // Dit wist de ADDR vlag en geeft de kloklijn (SCL) direct weer vrij!
-        volatile uint32_t star2 = I2C1->STAR2; 
-        (void)star2;
-        
-        // Leg direct alvast de ALLEREERSTE mogelijke byte klaar in de buffer 
-        // voor het geval dat de master direct een Read-actie start.
-        I2C1->DATAR = i2c_config_regs[i2c_reg_pointer];
-    }
-
-    // 2. RXNE Vlag: De Pi schrijft data naar ons (Pointer of registerwaarde)
-    if (star1 & I2C_STAR1_RXNE) {
-        uint8_t received_byte = I2C1->DATAR; // Het lezen wist de RXNE vlag automatisch
-        
-        if (i2c_first_byte) {
-            i2c_reg_pointer = received_byte % CONFIG_REGISTERS_SIZE; // Set de veilige 256-bytes pointer
-            i2c_first_byte = 0;
-        } else {
-            // Alleen schrijven toestaan naar de expliciete RW registers uit de map: (RW/RO)
-            if (i2c_reg_pointer == 0x01 || i2c_reg_pointer == 0x02 || i2c_reg_pointer == 0x03 ||
-                i2c_reg_pointer == 0x04 || i2c_reg_pointer == 0x05 || i2c_reg_pointer == 0x06 ||
-                i2c_reg_pointer == 0x10 || i2c_reg_pointer == 0x11 || i2c_reg_pointer == 0x12 ||
-                i2c_reg_pointer == 0x14 || i2c_reg_pointer == 0x15 || i2c_reg_pointer == 0x16 ||
-                i2c_reg_pointer == 0x17) {
-                
-                i2c_config_regs[i2c_reg_pointer] = received_byte; 
-            } else {
-                // Register is RO of gereserveerd: we negeren de data stilzwijgend.
-            }
-            
-            // De pointer moet ALTIJD ophogen, ook als het schrijven is geblokkeerd!
-            i2c_reg_pointer = (i2c_reg_pointer + 1) % CONFIG_REGISTERS_SIZE; 
-        }
-    }
-
-    // 3. TXE Vlag: De Pi wil een byte uit ons register lezen (i2cdump)
-    if (star1 & I2C_STAR1_TXE) {
-        // Vul direct het dataregister. Doordat SCL gerekt mag worden, 
-        // wacht de Pi netjes tot deze regel is uitgevoerd!
-        I2C1->DATAR = i2c_config_regs[i2c_reg_pointer]; 
-        i2c_reg_pointer = (i2c_reg_pointer + 1) % CONFIG_REGISTERS_SIZE; 
-    }
-
-    // 4. STOPF Vlag: De Pi sluit de transactie netjes af met een STOP
-    if (star1 & I2C_STAR1_STOPF) {
-        // Wist de STOPF vlag door CTLR1 naar zichzelf terug te schrijven
-        I2C1->CTLR1 = I2C1->CTLR1; 
-    }
-
-    // 5. AF / BERR Vlag: Herstel bij ACK-failure (gebeurt standaard aan het einde van elke i2cdump regel)
-    if (star1 & (I2C_STAR1_BERR | I2C_STAR1_AF)) {
-        I2C1->STAR1 &= ~(I2C_STAR1_BERR | I2C_STAR1_AF); // Wis de foutvlaggen om de bus te deblokkeren
-    }
-}
-*/
 
 // Schaduw-buffer voor de I2C-tijdregisters
 static uint8_t i2c_tijd_shadow[7] = {0};
 
-/*
-// Set date/time binary
-void I2C_EEPROM_SynchroniseerTijd1(void) {
-        if (i2c_config_regs[0x12] != i2c_tijd_shadow[2] || 
-            i2c_config_regs[0x11] != i2c_tijd_shadow[1] || 
-            i2c_config_regs[0x10] != i2c_tijd_shadow[0]) {
-            
-            // De Pi heeft overduidelijk nieuwe waarden gestuurd! Neem ze atomair over
-            __disable_irq();
-            interne_uren     = i2c_config_regs[0x10];
-            interne_minuten  = i2c_config_regs[0x11];
-            interne_seconden = i2c_config_regs[0x12];
-            interne_dag      = i2c_config_regs[0x14];
-            interne_maand    = i2c_config_regs[0x15];
-            interne_jaar     = i2c_config_regs[0x16];
-            __enable_irq();
-
-            // Update direct de schaduw-buffer naar de nieuwe werkelijkheid
-            i2c_tijd_shadow[0] = i2c_config_regs[0x10];
-            i2c_tijd_shadow[1] = i2c_config_regs[0x11];
-            i2c_tijd_shadow[2] = i2c_config_regs[0x12];
-            i2c_tijd_shadow[4] = i2c_config_regs[0x14];
-            i2c_tijd_shadow[5] = i2c_config_regs[0x15];
-            i2c_tijd_shadow[6] = i2c_config_regs[0x16];
-        } 
-        else {
-            i2c_config_regs[0x16] = i2c_tijd_shadow[6] = interne_jaar;
-            i2c_config_regs[0x15] = i2c_tijd_shadow[5] = interne_maand;
-            i2c_config_regs[0x14] = i2c_tijd_shadow[4] = interne_dag;
-            
-            i2c_config_regs[0x12] = i2c_tijd_shadow[2] = interne_seconden;
-            i2c_config_regs[0x11] = i2c_tijd_shadow[1] = interne_minuten;
-            i2c_config_regs[0x10] = i2c_tijd_shadow[0] = interne_uren;
-        }
-}
-*/
 
 /* Set date/time BCD
  * # Set de tijd naar 16:45:00 28 jun 2026 via BCD-registers
@@ -1120,7 +724,7 @@ void Flash_BlankCheck_Init(void) {
 
         // Sla deze fabrieksinstellingen direct permanent op in de Flash
         // Zodat bij de volgende boot de pagina niet meer als 'blank' wordt gezien
-        Flash_Save_EEPROM_Page();
+//        Flash_Save_EEPROM_Page();
     } 
     // 3. Als de Flash al geconfigureerde data bevat, laad deze in de RAM-array
     else {
@@ -1449,55 +1053,6 @@ void USART1_IRQHandler(void) {
 }
 
 
-/*
-void USART1_IRQHandler(void) {
-    if(USART1->STATR & USART_STATR_RXNE) {
-        char c = (char)(USART1->DATAR);
-
-        // NMEA Parser State Machine (Detecteert $xxRMC)
-        if (c == '$') { nmea_state = 1; return; }
-        if (nmea_state == 1 && c == 'G') { nmea_state = 2; return; }
-        if (nmea_state == 2 && (c == 'P' || c == 'N')) { nmea_state = 3; return; }
-        if (nmea_state == 3 && c == 'R') { nmea_state = 4; return; }
-        if (nmea_state == 4 && c == 'M') { nmea_state = 5; return; }
-        if (nmea_state == 5 && c == 'C') { 
-            nmea_state = 6; komma_teller = 0; tijd_index = 0; datum_index = 0; return; 
-        }
-
-        if (nmea_state == 6) {
-            if (c == ',') {
-                komma_teller++;
-                if (komma_teller == 10) {
-                    nieuwe_tijd_beschikbaar = 1; // en datum
-                    nmea_state = 0;
-                }
-                return;
-            }
-
-            // [Komma 1]: Tijd (hhmmss)
-            if (komma_teller == 1) {
-                if (tijd_index < 6) { tijd_buffer[tijd_index++] = c; }
-            } 
-            // [Komma 2]: GPS Status Vlag ('A' = Active / Fix, 'V' = Void / No Fix)
-            else if (komma_teller == 2) {
-                if (c == 'A') {
-                    i2c_config_regs[0x00] &= ~0x02; 
-                } 
-                else if (c == 'V') {
-                    i2c_config_regs[0x00] |= 0x02; 
-                    
-                    // Toon direct "E2-1" op het display (Facility 2 = GPS, Fout 1 = No Fix)
-                }
-            }
-            // [Komma 9]: Datum (ddmmyy)
-            else if (komma_teller == 9) {
-                if (datum_index < 6) { datum_buffer[datum_index++] = c; }
-            }
-        }
-    }
-}
-*/
-
 /* 
  * Genereert en zendt een proprietary NMEA-bericht met live kristal-kalibratiedata
  * Formaat: $PWCHCLK,hele_hz,fractie_mhz,baudrate_index*CS\r\n
@@ -1813,85 +1368,6 @@ void UART1_Send2Digits(uint8_t getal) {
     UART1_SendChar((getal % 10) + '0');
 }
 
-// 1x per seconde
-void Klok_VerwerkInterneTijd(void) {
-    // Schuif de tijd-as op met de dynamisch geleerde fixed-point waarde
-    start_systick_seconde += (uint32_t)(gemiddelde_seconde_fixed >> FILTER_SHIFT);
-
-    // Start de PPS-flits synchroon met de vrije klok
-//    GPIOD->BSHR = (1 << (4 + 16)); // PD4 LAAG (Ge?nverteerde LED gaat nu AAN)
-    GPIOD->BSHR = (1 << 4); // PD4 HOOG (Ge?nverteerde LED gaat nu UIT)
-
-    pps_led_start_tijd = SysTick->CNT;
-    pps_led_actief = 1;
-
-/*
-    interne_seconden++;
-    if (interne_seconden >= 60) {
-        interne_seconden = 0;
-        interne_minuten++;
-        if (interne_minuten >= 60) {
-            interne_minuten = 0;
-            interne_uren++;
-            if (interne_uren >= 24) {
-                interne_uren = 0;
-                
-                interne_dag++;
-                
-                // Bepaal het maximaal aantal dagen in de huidige maand
-                uint8_t max_dagen = 31;
-                
-                if (interne_maand == 4 || interne_maand == 6 || interne_maand == 9 || interne_maand == 11) {
-                    max_dagen = 30; // April, Juni, September, November
-                } 
-                else if (interne_maand == 2) {
-                    // Schrikkeljaar controle (de CH32V003 draait tussen 2000 en 2099)
-                    // Als het jaartal deelbaar is door 4, heeft februari 29 dagen
-                    if ((interne_jaar % 4) == 0) {
-                        max_dagen = 29;
-                    } else {
-                        max_dagen = 28;
-                    }
-                }
-                
-                // Controleer of we de maandgrens overschrijden
-                if (interne_dag > max_dagen) {
-                    interne_dag = 1;      // Reset naar de 1e van de nieuwe maand
-                    interne_maand++;       // Volgende maand
-                    
-                    // Controleer of we de jaargrens overschrijden
-                    if (interne_maand > 12) {
-                        interne_maand = 1; // Reset naar Januari
-                        interne_jaar++;    // Volgende jaar
-                    }
-                }
-            }
-        }
-    }
-*/
-
-    // Elke seconde het display verversen ?n het proprietary bericht uitsturen
-    if (freerunning_modus) {
-//        UART1_ZendProprietaryData();
-//        UART1_ZendGNRMC();
-        LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, 0);
-        
-    }
-
-    if (flash_write_interval > 0) {
-        flash_timer_seconden++;
-        
-        if (flash_timer_seconden >= (1UL << flash_write_interval)) {
-            flash_timer_seconden = 0;
-            trigger_flash_write = 1; // Zet de vlag voor de main loop
-        }
-    } else {
-        flash_timer_seconden = 0;
-        trigger_flash_write = 0;    // Geforceerd uitgeschakeld als register 0x02 gelijk is aan 0
-    }
-
-}
-
 void UART1_SendString(char *str) {
     while(*str) {
         UART1_SendChar(*str++);
@@ -1917,476 +1393,6 @@ void UART1_SendUint32(uint32_t getal) {
     UART1_SendString(&buffer[i]);
 }
 
-// ============================================================================
-// SMPTE ST12M LTC
-// ============================================================================
-
-/*
- * Initialiseer Timer 2 om interrupts te genereren op de LTC belfrequentie (4000 Hz)
- * Dit is nodig om de helft van een '1'-bit te kunnen timen (250 microseconden).
- */
-void LTC_Timer_Init(void) {
-    TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure = {0};
-
-    // 1. Klok inschakelen voor TIM2
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2, ENABLE);
-    
-    // 2. Configureer LTC GPIO Pin als Output Push-Pull (PD3)
-    GPIO_InitTypeDef GPIO_InitStructure = {0};
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOD, ENABLE);
-    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
-    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(LTC_GPIO_PORT, &GPIO_InitStructure);
-
-    // 3. TIM2 instellen voor 4000 Hz interrupt (250 us bij 24 MHz)
-    TIM_TimeBaseStructure.TIM_Period = 250 - 1;
-    //TIM_TimeBaseStructure.TIM_Prescaler = 24 - 1;
-//    TIM_TimeBaseStructure.TIM_Prescaler = 48 - 1;   // 48 MHz / 48 = 1 MHz (1 tick = 1 us)
-    TIM_TimeBaseStructure.TIM_Prescaler = (EEN_SECONDE_CYCLI / 1000000) - 1;
-
-
-    TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
-    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
-    TIM_TimeBaseInit(TIM2, &TIM_TimeBaseStructure);
-
-    // 4. Wis vlaggen, zet de interrupt aan en start de timer
-    TIM_ClearFlag(TIM2, TIM_FLAG_Update);
-    TIM_ITConfig(TIM2, TIM_IT_Update, ENABLE);
-    
-    NVIC_EnableIRQ(TIM2_IRQn);
-    TIM_Cmd(TIM2, ENABLE); // Dit vervangt de TIM_CR1_CEN regel volledig!
-}
-
-void LTC_BouwFrame(uint8_t u, uint8_t m, uint8_t s, uint8_t f) {
-    uint8_t tmp[10] = {0};
-    
-    // 1. Haal de offset op uit EEPROM register 0x06 en behandel direct als signed 8-bit integer (-127..+127)
-    //int16_t ltc_fr_offset = (int16_t)i2c_config_regs[0x06] - 127;
-    
-
-    // Stel hier je frame-rate in (bijv. 25 voor EBU, 30 voor SMPTE)
-    const uint8_t FPS = 25; 
-
-    // 2. Converteer de huidige invoertijd volledig naar frames (totaal aantal frames in de dag)
-    int32_t totaal_frames = ((int32_t)u * 3600 + (int32_t)m * 60 + (int32_t)s) * FPS + f;
-
-    // Pas de offset direct toe
-    totaal_frames += ltc_fr_offset;
-
-    // 3. Handhaaf rollover over de grens van een volledige dag (24 uur)
-    int32_t frames_per_dag = 24L * 3600L * FPS;
-    
-    if (totaal_frames < 0) {
-        totaal_frames += frames_per_dag;
-    } else if (totaal_frames >= frames_per_dag) {
-        totaal_frames -= frames_per_dag;
-    }
-
-    // 4. Herbereken de gecorrigeerde u, m, s, f parameters uit de frames
-    f = totaal_frames % FPS;
-    totaal_frames /= FPS;
-    s = totaal_frames % 60;
-    totaal_frames /= 60;
-    m = totaal_frames % 60;
-    u = totaal_frames / 60;
-
-    // --- VANAF HIER IS JOUW BESTAANDE SPLIT & MAPPING LOGICA ACTIEF ---
-    uint8_t f_een = f % 10;  uint8_t f_tien = f / 10;
-    uint8_t s_een = s % 10;  uint8_t s_tien = s / 10;
-    uint8_t m_een = m % 10;  uint8_t m_tien = m / 10;
-    uint8_t u_een = u % 10;  uint8_t u_tien = u / 10;
-
-    uint8_t d_een = interne_dag % 10;   uint8_t d_tien = interne_dag / 10;
-    uint8_t ma_een = interne_maand % 10; uint8_t ma_tien = interne_maand / 10;
-    uint8_t j_een = interne_jaar % 10;  uint8_t j_tien = interne_jaar / 10;
-
-    // SMPTE / EBU 80-BITS INTERLEAVED BIT MAPPING
-    tmp[0] = (f_een & 0x0F) | ((d_een & 0x0F) << 4);
-    tmp[1] = (f_tien & 0x03) | ((d_tien & 0x0F) << 4); 
-    tmp[2] = (s_een & 0x0F) | ((ma_een & 0x0F) << 4);
-    tmp[3] = (s_tien & 0x07) | ((ma_tien & 0x0F) << 4);
-    tmp[4] = (m_een & 0x0F) | ((j_een & 0x0F) << 4);
-    tmp[5] = (m_tien & 0x07) | ((j_tien & 0x0F) << 4);
-    tmp[6] = (u_een & 0x0F) | ((dipsw & 0x0F) << 4);
-    tmp[7] = (u_tien & 0x03) | (0x00 << 4); 
-
-    tmp[8] = 0xFC; 
-    tmp[9] = 0xBF; 
-
-    // ATOMIC TRANSFERS NAAR HARDWARE BUFFER
-    __disable_irq();
-    for(uint8_t i = 0; i < 10; i++) {
-        ltc_frame_buffer[i] = tmp[i];
-    }
-    __enable_irq();
-}
-
-
-
-/*
- * Timer 2 Hardware Interrupt - Genereert het LTC signaal op de GPIO-pin
- */
-void TIM2_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-void TIM2_IRQHandler(void) {
-    TIM2->INTFR = (uint16_t)~TIM_UIF; 
-
-    // 2. Bepaal de huidige bit-index (0 t/m 79) en de sub-stap (0 of 1)
-    uint8_t bit_index = ltc_stap_teller >> 1; // ltc_stap_teller / 2
-    uint8_t sub_stap  = ltc_stap_teller & 0x01; // ltc_stap_teller % 2
-
-    uint8_t byte_pos = bit_index >> 3;  // bit_index / 8
-    uint8_t bit_pos  = bit_index & 0x07; // bit_index % 8
-
-    // 3. Haal de bitwaarde op
-    uint8_t actieve_bit = (ltc_frame_buffer[byte_pos] >> bit_pos) & 0x01;
-
-    // 4. BPM Modulatie Beslissing Matrix
-    uint8_t moet_toggeleren = 0;
-
-    if (sub_stap == 0) {
-        // De start van ELKE bitperiode moet ALTIJD toggeleren
-        moet_toggeleren = 1;
-    } else {
-        // Halverwege de bitperiode: toggle ALLEEN als de bit een '1' is
-        if (actieve_bit == 1) {
-            moet_toggeleren = 1;
-        }
-    }
-
-    // 5. Voer de toggle fysiek uit op de GPIO-poort
-    if (moet_toggeleren) {
-        ltc_output_state ^= 1;
-        if (ltc_output_state) {
-            LTC_GPIO_PORT->BSHR = (1 << LTC_PIN);
-        } else {
-            LTC_GPIO_PORT->BSHR = (1 << (LTC_PIN + 16));
-        }
-    }
-
-    // 6. Schuif de teller op naar de volgende stap
-    ltc_stap_teller++;
-    if (ltc_stap_teller >= 160) {
-        ltc_stap_teller = 0; // Frame compleet, begin opnieuw bij bit 0
-
-        interne_frames++;
-
-        if (interne_frames >= 25) {
-            interne_frames = 0;
-            interne_seconden++;
-            if (interne_seconden >= 60) {
-                interne_seconden = 0;
-                interne_minuten++;
-                if (interne_minuten >= 60) {
-                    interne_minuten = 0;
-                    interne_uren++;
-                    if (interne_uren >= 24) {
-                        interne_uren = 0;
-                        interne_dag++;
-                        
-                        // Bepaal het maximaal aantal dagen in de huidige maand
-                        uint8_t max_dagen = 31;
-                        
-                        if (interne_maand == 4 || interne_maand == 6 || interne_maand == 9 || interne_maand == 11) {
-                            max_dagen = 30; // April, Juni, September, November
-                        } 
-                        else if (interne_maand == 2) {
-                            // Schrikkeljaar controle (de CH32V003 draait tussen 2000 en 2099)
-                            // Als het jaartal deelbaar is door 4, heeft februari 29 dagen
-                            if ((interne_jaar % 4) == 0) {
-                                max_dagen = 29;
-                            } else {
-                                max_dagen = 28;
-                            }
-                        }
-                        
-                        // Controleer of we de maandgrens overschrijden
-                        if (interne_dag > max_dagen) {
-                            interne_dag = 1;      // Reset naar de 1e van de nieuwe maand
-                            interne_maand++;       // Volgende maand
-                            
-                            // Controleer of we de jaargrens overschrijden
-                            if (interne_maand > 12) {
-                                interne_maand = 1; // Reset naar Januari
-                                interne_jaar++;    // Volgende jaar
-                            }
-                        }
-                    }
-                }
-            }
-
-#ifdef IRIGOUT
-            IRIG_BouwFrame(interne_uren, interne_minuten, interne_seconden);
-            irig_bit_index = 0; // Synchroniseer de IRIG bit-as strak met de LTC-as
-            irig_tick_counter = 0;
-#endif
-
-        }
-        
-        //LTC_BouwFrame(interne_uren, interne_minuten, interne_seconden, interne_frames);
-
-    }
-
-    #ifdef IRIGOUT
-    // ========================================================================
-    // IRIG-B GENERATOR ENGINE (Elke interrupt = 250 us)
-    // ========================================================================
-    uint8_t huidige_irig_type = irig_bits[irig_bit_index];
-    uint8_t irig_hoog_grens = 8; // Standaard Bit '0': 2 ms hoog = 8 ticks * 250us
-
-    if (huidige_irig_type == 1) {
-        irig_hoog_grens = 20;    // Bit '1': 5 ms hoog = 20 ticks
-    } else if (huidige_irig_type == 2) {
-        irig_hoog_grens = 32;    // Sync Marker (P): 8 ms hoog = 32 ticks
-    }
-
-    // PWM Schakelmomenten uitvoeren op IRIG_PIN
-    if (irig_tick_counter < irig_hoog_grens) {
-        IRIG_GPIO_PORT->BSHR = (1 << IRIG_PIN);        // Pin HOOG
-    } else {
-        IRIG_GPIO_PORT->BSHR = (1 << (IRIG_PIN + 16)); // Pin LAAG
-    }
-
-    irig_tick_counter++;
-    if (irig_tick_counter >= 40) { // 40 ticks * 250us = 10 ms voorbij. Volgende bit!
-        irig_tick_counter = 0;
-        irig_bit_index++;
-        if (irig_bit_index >= 100) {
-            irig_bit_index = 0; // 100 bits = 1 seconde voorbij
-        }
-    }
-    // ========================================================================
-#endif
-}
-
-#ifdef IRIGOUT
-// ========================================================================
-// IRIG-B GENERATOR ENGINE (Elke interrupt = 250 us)
-// ========================================================================
-
-/*
- * Berekent de dag van het jaar (1 - 366) op basis van dag, maand en jaar.
- */
-uint16_t BerekenDagVanJaar(uint8_t dag, uint8_t maand, uint8_t jaar) {
-    // Aantal dagen voorafgaand aan elke maand (normaal jaar)
-    const uint16_t dagen_voor_maand[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
-    
-    uint16_t doy = dagen_voor_maand[maand - 1] + dag;
-    
-    // Schrikkeljaarcontrole (CH32V003 draait in de 21e eeuw, dus deelbaar door 4 is voldoende)
-    if (maand > 2 && (jaar % 4 == 0)) {
-        doy++; // Voeg een dag toe voor 29 februari
-    }
-    
-    return doy;
-}
-
-
-void IRIG_Init(void) {
-    // Configureer ook PD5 als Output Push-Pull voor IRIG-B
-    IRIG_GPIO_PORT->CFGLR &= ~(0xF << (IRIG_PIN * 4)); 
-    IRIG_GPIO_PORT->CFGLR |= (0x3 << (IRIG_PIN * 4));  
-}
-
-/*
-void IRIG_BouwFrame0(uint8_t u, uint8_t m, uint8_t s) {
-    // Wis de bitstream (alles op '0')
-    for(uint8_t i = 0; i < 100; i++) irig_bits[i] = 0;
-
-    // Plaats de verplichte Position Identifiers (8ms pulsen)
-    irig_bits[0]  = 2; // P0 (Start van frame)
-    irig_bits[9]  = 2; // P1
-    irig_bits[19] = 2; // P2
-    irig_bits[29] = 2; // P3
-    irig_bits[39] = 2; // P4
-    irig_bits[49] = 2; // P5
-    irig_bits[59] = 2; // P6
-    irig_bits[69] = 2; // P7
-    irig_bits[79] = 2; // P8
-    irig_bits[89] = 2; // P9
-    irig_bits[99] = 2; // P5 (Laatste bit voor de omslag)
-
-    // Codeer Seconden (Bits 1-4 eenheden, Bits 6-8 tientallen)
-    uint8_t s_een = s % 10; uint8_t s_tien = s / 10;
-    if(s_een & 0x01) irig_bits[1] = 1; if(s_een & 0x02) irig_bits[2] = 1;
-    if(s_een & 0x04) irig_bits[3] = 1; if(s_een & 0x08) irig_bits[4] = 1;
-    if(s_tien & 0x01) irig_bits[5] = 1; if(s_tien & 0x02) irig_bits[6] = 1;
-    if(s_tien & 0x04) irig_bits[7] = 1;
-
-    // Codeer Minuten (Bits 10-13 eenheden, Bits 15-17 tientallen)
-    uint8_t m_een = m % 10; uint8_t m_tien = m / 10;
-    if(m_een & 0x01) irig_bits[10] = 1; if(m_een & 0x02) irig_bits[11] = 1;
-    if(m_een & 0x04) irig_bits[12] = 1; if(m_een & 0x08) irig_bits[13] = 1;
-    if(m_tien & 0x01) irig_bits[15] = 1; if(m_tien & 0x02) irig_bits[16] = 1;
-    if(m_tien & 0x04) irig_bits[17] = 1;
-
-    // Codeer Uren (Bits 20-23 eenheden, Bits 25-26 tientallen)
-    uint8_t u_een = u % 10; uint8_t u_tien = u / 10;
-    if(u_een & 0x01) irig_bits[20] = 1; if(u_een & 0x02) irig_bits[21] = 1;
-    if(u_een & 0x04) irig_bits[22] = 1; if(u_een & 0x08) irig_bits[23] = 1;
-    if(u_tien & 0x01) irig_bits[25] = 1; if(u_tien & 0x02) irig_bits[26] = 1;
-
-    // --- MS OFFSET SYNC LOGICA ---
-    // Haal de milliseconde offset op uit EEPROM register 0x07 (-127..+127 ms)
-    //int32_t irig_ms_offset = (int32_t)i2c_config_regs[0x07] - 127;
-
-    // Converteer ms naar timer ticks (1 ms = 4 ticks van 250us)
-    int32_t tick_offset = irig_ms_offset * 4; 
-
-    // Bereken de nieuwe startpositie binnen de 4000 ticks van de seconde.
-    // We trekken de tick_offset af om de puls te vervroegen bij een positieve offset.
-    int32_t target_ticks = 0 - tick_offset;
-
-    // Zorg dat het getal altijd binnen het bereik van 0 tot 3999 ticks valt (rollover)
-    while (target_ticks < 0)      target_ticks += 4000;
-    while (target_ticks >= 4000) target_ticks -= 4000;
-
-    // Dwing de IRIG engine direct naar deze verschoven bit- en tick-positie
-    __disable_irq();
-    irig_bit_index = target_ticks / 40;   // Bepaal welke van de 100 bits nu actief moet zijn
-    irig_tick_counter = target_ticks % 40;// Bepaal de sub-tick (0..39) binnen die bit
-    __enable_irq();
-}
-*/
-
-void IRIG_BouwFrame(uint8_t u, uint8_t m, uint8_t s) {
-    // Bereken eerst de Day of Year (DoY) op basis van de live kalenderregisters
-    uint16_t doy = BerekenDagVanJaar(interne_dag, interne_maand, interne_jaar);
-
-    // Splits de variabelen op in eenheden, tientallen en honderdtallen (BCD-ready)
-    uint8_t s_ones = s % 10, s_tens = s / 10;
-    uint8_t m_ones = m % 10, m_tens = m / 10;
-    uint8_t u_ones = u % 10, u_tens = u / 10;
-    
-    uint8_t d_ones = doy % 10;
-    uint8_t d_tens = (doy / 10) % 10;
-    uint8_t d_huns = doy / 100;
-
-    uint8_t yr_ones = interne_jaar % 10;
-    uint8_t yr_tens = interne_jaar / 10;
-
-    // --- BITS 0 t/m 9: SECONDEN & P1 ---
-    irig_bits[0]  = 0; // P0 Marker (Harde start)
-    irig_bits[1]  = (s_ones & 0x01) ? 1 : 0;
-    irig_bits[2]  = (s_ones & 0x02) ? 1 : 0;
-    irig_bits[3]  = (s_ones & 0x04) ? 1 : 0;
-    irig_bits[4]  = (s_ones & 0x08) ? 1 : 0;
-    irig_bits[5]  = 0; // Ongebruikt
-    irig_bits[6]  = (s_tens & 0x01) ? 1 : 0;
-    irig_bits[7]  = (s_tens & 0x02) ? 1 : 0;
-    irig_bits[8]  = (s_tens & 0x04) ? 1 : 0;
-    irig_bits[9]  = 0; // P1 Marker
-
-    // --- BITS 10 t/m 19: MINUTEN & P2 ---
-    irig_bits[10] = (m_ones & 0x01) ? 1 : 0;
-    irig_bits[11] = (m_ones & 0x02) ? 1 : 0;
-    irig_bits[12] = (m_ones & 0x04) ? 1 : 0;
-    irig_bits[13] = (m_ones & 0x08) ? 1 : 0;
-    irig_bits[14] = 0; // Ongebruikt
-    irig_bits[15] = (m_tens & 0x01) ? 1 : 0;
-    irig_bits[16] = (m_tens & 0x02) ? 1 : 0;
-    irig_bits[17] = (m_tens & 0x04) ? 1 : 0;
-    irig_bits[18] = 0; // Ongebruikt
-    irig_bits[19] = 0; // P2 Marker
-
-    // --- BITS 20 t/m 29: UREN & P3 ---
-    irig_bits[20] = (u_ones & 0x01) ? 1 : 0;
-    irig_bits[21] = (u_ones & 0x02) ? 1 : 0;
-    irig_bits[22] = (u_ones & 0x04) ? 1 : 0;
-    irig_bits[23] = (u_ones & 0x08) ? 1 : 0;
-    irig_bits[24] = 0; // Ongebruikt
-    irig_bits[25] = (u_tens & 0x01) ? 1 : 0;
-    irig_bits[26] = (u_tens & 0x02) ? 1 : 0;
-    irig_bits[27] = 0; // Ongebruikt
-    irig_bits[28] = 0; // Ongebruikt
-    irig_bits[29] = 0; // P3 Marker
-
-    // --- BITS 30 t/m 39: DAG VAN HET JAAR (DoY) & P4 ---
-    irig_bits[30] = (d_ones & 0x01) ? 1 : 0;
-    irig_bits[31] = (d_ones & 0x02) ? 1 : 0;
-    irig_bits[32] = (d_ones & 0x04) ? 1 : 0;
-    irig_bits[33] = (d_ones & 0x08) ? 1 : 0;
-    irig_bits[34] = 0; // Ongebruikt
-    irig_bits[35] = (d_tens & 0x01) ? 1 : 0;
-    irig_bits[36] = (d_tens & 0x02) ? 1 : 0;
-    irig_bits[37] = (d_tens & 0x04) ? 1 : 0;
-    irig_bits[38] = (d_tens & 0x08) ? 1 : 0;
-    irig_bits[39] = 0; // P4 Marker
-
-    // --- BITS 40 t/m 49: HONDERDTALLEN DAGEN & P5 ---
-    irig_bits[40] = (d_huns & 0x01) ? 1 : 0;
-    irig_bits[41] = (d_huns & 0x02) ? 1 : 0;
-    irig_bits[42] = 0; // Ongebruikt
-    irig_bits[43] = 0; // Ongebruikt
-    irig_bits[44] = 0; // Ongebruikt
-    irig_bits[45] = 0; // Ongebruikt
-    irig_bits[46] = 0; // Ongebruikt
-    irig_bits[47] = 0; // Ongebruikt
-    irig_bits[48] = 0; // Ongebruikt
-    irig_bits[49] = 0; // P5 Marker
-
-    // --- BITS 50 t/m 59: BCD JAAR (IRIG 200-04 Spec) & P6 ---
-    irig_bits[50] = (yr_ones & 0x01) ? 1 : 0;
-    irig_bits[51] = (yr_ones & 0x02) ? 1 : 0;
-    irig_bits[52] = (yr_ones & 0x04) ? 1 : 0;
-    irig_bits[53] = (yr_ones & 0x08) ? 1 : 0;
-    irig_bits[54] = 0; // Leeg/Unassigned spacer bit
-    irig_bits[55] = (yr_tens & 0x01) ? 1 : 0;
-    irig_bits[56] = (yr_tens & 0x02) ? 1 : 0;
-    irig_bits[57] = (yr_tens & 0x04) ? 1 : 0;
-    irig_bits[58] = (yr_tens & 0x08) ? 1 : 0;
-    irig_bits[59] = 0; // P6 Marker
-
-    // --- BITS 60 t/m 69: IEEE 1344 CONTROL BITS (DST & TIMEZONE) & P7 ---
-    // We lezen live uit de virtuele EEPROM map
-    uint8_t dst_vlag = (i2c_config_regs[0x17] & 0x01); // Haal DST bit op uit RAM map
-    irig_bits[60] = 0; // LSP (Leap Second Pending)
-    irig_bits[61] = 0; // LS (Leap Second Type)
-    irig_bits[62] = 0; // DSP (DST Change Pending)
-    irig_bits[63] = dst_vlag ? 1 : 0; // DST in effect!
-    irig_bits[64] = (tijdzone_offset < 0) ? 1 : 0; // Tijdzone teken bit (0=+, 1=-)
-    
-    // Timezone Offset mapping (Bits 65-68)
-    uint8_t tz_abs = (tijdzone_offset < 0) ? -tijdzone_offset : tijdzone_offset;
-    irig_bits[65] = (tz_abs & 0x01) ? 1 : 0;
-    irig_bits[66] = (tz_abs & 0x02) ? 1 : 0;
-    irig_bits[67] = (tz_abs & 0x04) ? 1 : 0;
-    irig_bits[68] = (tz_abs & 0x08) ? 1 : 0;
-    irig_bits[69] = 0; // P7 Marker
-
-    // --- BITS 70 t/m 79: TIME QUALITY & PARITY & P8 ---
-    irig_bits[70] = 0; // Time Quality bit 0
-    irig_bits[71] = 1; // Time Quality bit 1 (Stel we rapporteren 'Locked' status)
-    irig_bits[72] = 0; // Time Quality bit 2
-    irig_bits[73] = 0; // Time Quality bit 3
-    
-    // Berekening van de Even Parity (Bit 75) over bits 1 t/m 74
-    uint8_t parity = 0;
-    for (int i = 1; i <= 74; i++) {
-        if (irig_bits[i] == 1) parity++;
-    }
-    irig_bits[74] = (parity % 2 != 0) ? 1 : 0; // Zet bit om parity even te maken
-    
-    irig_bits[76] = 0; irig_bits[77] = 0; irig_bits[78] = 0; // Gereserveerd/Leeg
-    irig_bits[79] = 0; // P8 Marker
-
-    // --- BITS 80 t/m 99: STRAIGHT BINARY SECONDS (SBS) & P9 & P0 ---
-    // Het totale aantal verstreken seconden sinds middernacht (0 - 86399)
-    uint32_t sbs_waarde = ((uint32_t)u * 3600) + ((uint32_t)m * 60) + s;
-    
-    uint8_t bit_teller = 0;
-    for (uint8_t i = 80; i < 99; i++) {
-        if (i == 89) {
-            irig_bits[89] = 0; // P9 Marker overschrijft SBS stroom niet, deze is geforceerd
-            continue;
-        }
-        irig_bits[i] = (sbs_waarde & (1UL << bit_teller)) ? 1 : 0;
-        bit_teller++;
-    }
-    irig_bits[99] = 0; // Finale P0 Marker (Sluit de seconde af)
-}
-
-#endif
 
 
 // ========================================================================
@@ -2434,12 +1440,6 @@ void Flash_Save_EEPROM_Page(void) {
     Flash_Lock();
 }
 
-// ============================================================================
-// CHARLYPLEXING DISPLAY
-// ============================================================================
-
-
-
 
 // ============================================================================
 // HOOFDPROGRAMMA & CORE TIME LOOPS
@@ -2448,7 +1448,6 @@ void Flash_Save_EEPROM_Page(void) {
 
 
 int main(void) {
-    int8_t res;
 //    SystemInitBareMetal_HSE_24MHz();
 //  SystemInitBareMetal_HSI_24MHz();
     SystemInitBareMetal_HSI_48MHz();
@@ -2457,32 +1456,11 @@ int main(void) {
     SysTick->CTLR = 0x00000005;     
     Peripherals_Init();
     Pure_Hardware_I2C_Slave_Init();
-//    I2C_EEPROM_VulTestpatroon();
     Flash_BlankCheck_Init();
 
-//    PCF9557_WriteRegister(0x03, 0xF0);
-//    PCF9557_WriteRegister(0x01, 0x0f);
     dipsw = PCF9557_LeesHogeBits();
 
-//    UART1_SendString("NMEA clock ID:"); UART1_SendUint32(dipsw); UART1_SendString("\r\n");
-
-    res = UART1_DetecteerBaudrate();
-    if(res >= 0) {
-        // Stuur een melding naar de PC dat we succesvol gelockt zijn
-//        UART1_SendString("NMEA clock input detected [Auto-Baud]: ");
-//        UART1_SendUint32(BaudrateTabel[huidige_baudrate_index]);
-//        UART1_SendString(" baud!\r\n");
-    } else {
-//        UART1_SendString("E1-");
-//        UART1_SendUint32(res);
-        i2c_config_regs[0x00] |= 0x01;
-        Delay_us(5000000);
-    }
-
-//    LTC_Timer_Init();
-#ifdef IRIGOUT
-    IRIG_Init();
-#endif
+    UART1_DetecteerBaudrate();
 
     start_systick_seconde = SysTick->CNT;
     laatste_gps_pakket_tijd = SysTick->CNT;
@@ -2516,10 +1494,8 @@ int main(void) {
         if( freerunning_modus != freerunning_modus_old) {
             if(freerunning_modus) {
                 i2c_config_regs[0x00] |= 0x02;
-                UART1_SendString("clocksource: internal\r\n");
             } else {
                 i2c_config_regs[0x00] &= ~0x02;
-                UART1_SendString("clocksource: NMEA\r\n");
             }
             freerunning_modus_old = freerunning_modus;
         }
@@ -2538,10 +1514,7 @@ int main(void) {
 
         // 3. Update de tijd autonoom elke seconde
         if ((SysTick->CNT - start_systick_seconde) >= (uint32_t)(gemiddelde_seconde_fixed >> FILTER_SHIFT)) {
-//            Klok_VerwerkInterneTijd();
 
-            ltc_fr_offset = (int16_t)i2c_config_regs[0x06] - 127;
-            irig_ms_offset = (int32_t)i2c_config_regs[0x07] - 127;
             tijdzone_offset = (int8_t) i2c_config_regs[0x17];
             if (i2c_config_regs[0x06] == 255) i2c_config_regs[0x06] = 127; // Reset naar 0 offset
             if (i2c_config_regs[0x07] == 255) i2c_config_regs[0x07] = 127; // Reset naar 0 offset
